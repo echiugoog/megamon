@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"sync"
@@ -414,7 +413,7 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 
 	wg.Add(1)
 	go func() {
-		log.Println("starting metrics server")
+		setupLog.Info("starting metrics server")
 		defer wg.Done()
 		if err := metricsServer.ListenAndServe(); err != nil {
 			if errors.Is(err, http.ErrServerClosed) {

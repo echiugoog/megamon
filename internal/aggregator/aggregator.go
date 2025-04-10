@@ -3,6 +3,7 @@ package aggregator
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+)
+
+const (
+	TPUAcceleratorResourceName = "google.com/tpu"
 )
 
 type Aggregator struct {
@@ -172,7 +177,6 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 		ready := k8sutils.IsNodeReady(&node)
 
 		// Node pool mapping:
-
 		if npName, ok := k8sutils.GetNodePool(&node); ok {
 			func() {
 				if !k8sutils.IsTPUNode(&node) {
@@ -195,6 +199,17 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 				}
 				if ready {
 					up.ReadyCount++
+				}
+				nodeAlloc := node.Status.Allocatable
+				if nodeAlloc != nil {
+					if rl, ok := nodeAlloc[TPUAcceleratorResourceName]; ok {
+						allocatable, err := strconv.ParseInt(rl.String(), 10, 64)
+						if err != nil {
+							log.Error(err, "error getting TPU alloctable count", "node", node.Name, "resourceList", rl)
+						} else {
+							up.NodePoolAllocatableTPUs += int32(allocatable)
+						}
+					}
 				}
 				report.NodePoolsUp[npName] = up
 			}()

@@ -239,6 +239,10 @@ func mustRegisterUpnessMetrics(prefix string, meter metric.Meter) ([]metric.Obse
 		metric.WithDescription("Total number of TPU chips."))
 	fatal(err)
 
+	tpuAllocCount, err := meter.Int64ObservableGauge(prefix+".tpu.allocatable.count",
+		metric.WithDescription("Total number of allocatable TPU chips for a nodepool."))
+	fatal(err)
+
 	observeFunc := func(ctx context.Context, o metric.Observer, upnesses map[string]records.Upness, summaries map[string]records.UpnessSummaryWithAttrs) {
 		for _, upness := range upnesses {
 			val := int64(0)
@@ -280,6 +284,9 @@ func mustRegisterUpnessMetrics(prefix string, meter metric.Meter) ([]metric.Obse
 			if summary.TPUChipCount != 0 {
 				o.ObserveInt64(tpuChipCount, int64(summary.TPUChipCount), metric.WithAttributes(commonAttrs...))
 			}
+			if summary.NodePoolAllocatableTPUs != 0 {
+				o.ObserveInt64(tpuAllocCount, int64(summary.NodePoolAllocatableTPUs), metric.WithAttributes(commonAttrs...))
+			}
 		}
 	}
 
@@ -297,6 +304,7 @@ func mustRegisterUpnessMetrics(prefix string, meter metric.Meter) ([]metric.Obse
 		interruptionCount,
 		recoveryCount,
 		tpuChipCount,
+		tpuAllocCount,
 	}, observeFunc
 }
 

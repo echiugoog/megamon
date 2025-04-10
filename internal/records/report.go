@@ -31,7 +31,8 @@ type Attrs struct {
 	TPUChipCount   int32  `json:"tpuChipCount"`
 	Spot           bool   `json:"spot"`
 
-	NodePoolName string `json:"nodePoolName"`
+	NodePoolName            string `json:"nodePoolName"`
+	NodePoolAllocatableTPUs int32  `json:"nodeAllocatableTPUs,omitempty"`
 }
 
 type Upness struct {

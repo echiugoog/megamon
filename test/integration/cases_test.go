@@ -30,7 +30,10 @@ import (
 	. "github.com/onsi/gomega"
 	containerv1beta1 "google.golang.org/api/container/v1beta1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -110,10 +113,27 @@ var (
 	}
 )
 
-var _ = Describe("Nodepool metrics", func() {
-	Context("When reconciling a resource", func() {
-		ctx := context.Background()
+var _ = Describe("Nodepool metrics", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var testEnv *envtest.Environment
+	var restCfg *rest.Config
+	var k8sClient client.Client
 
+	BeforeAll(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		testEnv, restCfg, k8sClient = startTestEnv()
+		metricsAddr = startManager(ctx, false, restCfg)
+	})
+
+	AfterAll(func() {
+		cancel()
+		time.Sleep(3 * time.Second) // Wait for manager shutdown
+		stopTestEnv(testEnv)
+	})
+
+	Context("When reconciling a resource", func() {
 		jsRef := types.NamespacedName{
 			Name:      "test-jobset",
 			Namespace: "default",
@@ -179,7 +199,7 @@ var _ = Describe("Nodepool metrics", func() {
 
 		It("should publish nodepool metrics", func() {
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				// Depends on node and jobset pod being created
 				nodepool.job_scheduled.WithValue(1),
 				// Only depend on nodepool being created
@@ -205,7 +225,7 @@ var _ = Describe("Nodepool metrics", func() {
 			By("rechecking the metrics for nodepool_up")
 			time.Sleep(3 * time.Second)
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(0),
@@ -253,7 +273,7 @@ var _ = Describe("Nodepool metrics", func() {
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(0),
@@ -285,7 +305,7 @@ var _ = Describe("Nodepool metrics", func() {
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(1),
@@ -318,7 +338,7 @@ var _ = Describe("Nodepool metrics", func() {
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(1),
@@ -327,24 +347,31 @@ var _ = Describe("Nodepool metrics", func() {
 				nodepool.up_time_seconds,
 				nodepool.tpu_chip_count.WithValue(256),
 			)
-
 		})
-
 	})
 })
 
-var _ = Describe("JobSet metrics", func() {
+var _ = Describe("JobSet metrics", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var testEnv *envtest.Environment
+	var restCfg *rest.Config
+	var k8sClient client.Client
+
+	BeforeAll(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		testEnv, restCfg, k8sClient = startTestEnv()
+		metricsAddr = startManager(ctx, false, restCfg)
+	})
+
+	AfterAll(func() {
+		cancel()
+		time.Sleep(3 * time.Second) // Wait for manager shutdown
+		stopTestEnv(testEnv)
+	})
+
 	Context("When reconciling a resource", func() {
-		ctx := context.Background()
-
-		//BeforeEach(func() {
-		//})
-
-		//AfterEach(func() {
-		//	By("Cleanup the specific resource instance")
-		//	Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		//})
-
 		js := jobsetSingleJob
 		It("should watch a JobSet", func() {
 			Expect(k8sClient.Create(ctx, js)).To(Succeed())
@@ -352,7 +379,7 @@ var _ = Describe("JobSet metrics", func() {
 
 		It("should publish metrics after submitting a jobset", func() {
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(0),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -374,7 +401,7 @@ var _ = Describe("JobSet metrics", func() {
 
 			By("rechecking the metrics")
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(1),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -397,7 +424,7 @@ var _ = Describe("JobSet metrics", func() {
 
 			By("rechecking the metrics")
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(0),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -423,7 +450,7 @@ var _ = Describe("JobSet metrics", func() {
 
 			By("rechecking the metrics")
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(1),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -446,7 +473,7 @@ var _ = Describe("JobSet metrics", func() {
 		It("should publish total TPU chip counts by jobset with multiple replicated jobs with >1 replica", func() {
 			By("looking at TPU topology per replicated job in a deployed jobset")
 			metrics := expectedMetricsForJobSet(jobsetMultipleRJobs, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				metrics.tpu_chip_count.WithValue(24),
 			)
 		})
@@ -592,8 +619,8 @@ func expectedMetricsForJobSet(js *jobset.JobSet, tpuTopology string) upnessMetri
 	}
 }
 
-func fetchMetrics() (string, error) {
-	resp, err := http.Get("http://" + testCfg.MetricsAddr + "/metrics")
+func fetchMetrics(addr string) (string, error) {
+	resp, err := http.Get("http://" + addr + "/metrics")
 	if err != nil {
 		return "", err
 	}
@@ -605,12 +632,12 @@ func fetchMetrics() (string, error) {
 	return string(body), nil
 }
 
-func assertMetrics(expected ...metric) {
+func assertMetrics(addr string, expected ...metric) {
 	GinkgoHelper()
 	var metrics string
 	Eventually(func() (string, error) {
 		var err error
-		metrics, err = fetchMetrics()
+		metrics, err = fetchMetrics(addr)
 		return metrics, err
 	}, "3s", "1s").Should(ContainSubstring(expected[0].String()), "initial metric not found")
 	for _, exp := range expected {

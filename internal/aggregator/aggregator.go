@@ -150,8 +150,8 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 		for _, s := range sliceList.Items {
 			attrs := records.Attrs{
 				SliceName:      s.Name,
-				SliceOwner:     s.Labels["tpu-provisioner.cloud.google.com/owner-name"],
-				SliceOwnerKind: s.Labels["tpu-provisioner.cloud.google.com/owner-kind"],
+				SliceOwner:     s.Labels[k8sutils.LabelTPUProvisionerOwnerName],
+				SliceOwnerKind: s.Labels[k8sutils.LabelTPUProvisionerOwnerKind],
 				TPUAccelerator: string(s.Spec.Type),
 				TPUTopology:    s.Spec.Topology,
 			}

@@ -148,8 +148,11 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 			return fmt.Errorf("listing slices: %w", err)
 		}
 		for _, s := range sliceList.Items {
+			sliceUID := string(s.UID)
+			sliceOwnerNameSpace := s.Labels[k8sutils.LabelTPUProvisionerOwnerNamespace]
 			attrs := records.Attrs{
 				SliceName:      s.Name,
+				SliceUID:       sliceUID,
 				SliceOwner:     s.Labels[k8sutils.LabelTPUProvisionerOwnerName],
 				SliceOwnerKind: s.Labels[k8sutils.LabelTPUProvisionerOwnerKind],
 				TPUAccelerator: string(s.Spec.Type),
@@ -176,6 +179,24 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 			}
 
 			report.SlicesUp[s.Name] = up
+
+			// update jobset attribute with slice attribute if found
+			if attrs.SliceOwnerKind == "jobset" {
+				fmt.Printf("uidkey: %s\n", uidMapKey(sliceOwnerNameSpace, attrs.SliceOwner))
+				if uid, ok := uidMap[uidMapKey(sliceOwnerNameSpace, attrs.SliceOwner)]; ok {
+					if jsUp, ok := report.JobSetsUp[uid]; ok {
+						jsUp.Attrs.SliceName = s.Name
+						jsUp.Attrs.SliceUID = sliceUID
+						report.JobSetsUp[uid] = jsUp
+					} else {
+						log.Info("Cannot find jobset for slice", "slice", s.Name, "jobset", attrs.SliceOwner)
+					}
+				} else {
+					log.Info("Warning cannot find jobset UID for jobset", "slice", s.Name, "jobset", attrs.SliceOwner)
+				}
+			} else {
+				log.V(3).Info("slice is owned by non-jobset", "slice", s.Name, "owner", attrs.SliceOwner, "ownerKind", attrs.SliceOwnerKind)
+			}
 		}
 	}
 

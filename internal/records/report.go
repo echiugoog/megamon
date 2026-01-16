@@ -43,6 +43,7 @@ type Attrs struct {
 	SliceUID       string `json:"sliceUID"`
 	SliceOwner     string `json:"sliceOwner"`
 	SliceOwnerKind string `json:"sliceOwnerKind"`
+	SliceState     string `json:"sliceState"`
 }
 
 type Upness struct {

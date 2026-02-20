@@ -50,7 +50,7 @@ type Upness struct {
 	ExpectedCount int32  `json:"expectedCount"`
 	UnknownCount  int32  `json:"unknownCount"`
 	Status        string `json:"status"`
-	ExpectedDown  bool   `json:"ed"`
+	ExpectedDown  bool   `json:"expectedDown"`
 	Attrs
 }
 

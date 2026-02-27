@@ -160,6 +160,7 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 		for _, s := range sliceList.Items {
 			attrs := records.Attrs{
 				SliceName:      s.Name,
+				SliceUID:       string(s.UID),
 				TPUAccelerator: string(s.Spec.Type),
 				TPUTopology:    s.Spec.Topology,
 			}

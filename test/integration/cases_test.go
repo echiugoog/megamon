@@ -132,6 +132,8 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 	var restCfg *rest.Config
 	var k8sClient client.Client
 
+	aggregationInterval := 1
+
 	BeforeAll(func() {
 		ctx, cancel = context.WithCancel(context.Background())
 		_, restCfg, k8sClient = startTestEnv()
@@ -139,7 +141,7 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 			cancel()
 			time.Sleep(3 * time.Second) // Wait for manager shutdown
 		})
-		metricsAddr = startManager(ctx, false, restCfg)
+		metricsAddr = startManager(ctx, false, restCfg, aggregationInterval)
 	})
 
 	Context("When reconciling a resource", func() {
@@ -196,7 +198,7 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 
 		// Necessary because pod reconciler uses a cached client
 		// which is eventually consistent w k8sClient here
-		time.Sleep(5 * time.Second)
+		time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 		It("should watch a Pod", func() {
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
@@ -204,7 +206,7 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 
 		// Necessary because pod reconciler uses a cached client
 		// which is eventually consistent w k8sClient here
-		time.Sleep(5 * time.Second)
+		time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 		It("should publish nodepool metrics", func() {
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
@@ -232,7 +234,7 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 
 			// nodepool_up should still be 0; 16x16 topology expects 256
 			By("rechecking the metrics for nodepool_up")
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
 			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
@@ -278,7 +280,7 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 		// upness validation
 		It("should update nodepool_up metric to 1 when all the nodes becomes Ready", func() {
 			// Allow time for aggregation (1s interval) and metric update
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
@@ -310,7 +312,7 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 			Expect(updateErr).To(BeNil())
 
 			// Allow time for aggregation (1s interval) and metric update
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
@@ -343,7 +345,7 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 			Expect(updateErr).To(BeNil())
 
 			// Allow time for aggregation (1s interval) and metric update
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
@@ -367,7 +369,7 @@ var _ = Describe("JobSet metrics", Ordered, func() {
 	var metricsAddr string
 	var restCfg *rest.Config
 	var k8sClient client.Client
-
+	aggregationInterval := 1
 	BeforeAll(func() {
 		ctx, cancel = context.WithCancel(context.Background())
 		_, restCfg, k8sClient = startTestEnv()
@@ -375,7 +377,7 @@ var _ = Describe("JobSet metrics", Ordered, func() {
 			cancel()
 			time.Sleep(3 * time.Second) // Wait for manager shutdown
 		})
-		metricsAddr = startManager(ctx, false, restCfg)
+		metricsAddr = startManager(ctx, false, restCfg, aggregationInterval)
 	})
 
 	Context("When reconciling a resource", func() {
@@ -541,7 +543,7 @@ var _ = Describe("JobSet Node metrics absent when slice is enabled", Ordered, fu
 			cancel()
 			time.Sleep(3 * time.Second) // Wait for manager shutdown
 		})
-		metricsAddr = startManager(ctx, true, restCfg)
+		metricsAddr = startManager(ctx, true, restCfg, 1)
 	})
 
 	It("should not publish any jobset node metrics when slice is enabled", func() {
@@ -722,6 +724,8 @@ var _ = Describe("Slice Metrics Scenarios", func() {
 		var restCfg *rest.Config
 		var k8sClient client.Client
 
+		aggregationInterval := 1
+
 		BeforeEach(func() {
 			ctx, cancel = context.WithCancel(context.Background())
 			_, restCfg, k8sClient = startTestEnv()
@@ -730,7 +734,7 @@ var _ = Describe("Slice Metrics Scenarios", func() {
 				time.Sleep(3 * time.Second) // Wait for manager shutdown
 			})
 
-			metricsAddr = startManager(ctx, enableSlice, restCfg)
+			metricsAddr = startManager(ctx, enableSlice, restCfg, aggregationInterval)
 			s = &slice.Slice{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: fmt.Sprintf("test-slice-%v", enableSlice),
@@ -752,7 +756,7 @@ var _ = Describe("Slice Metrics Scenarios", func() {
 			By("watching a Slice")
 			Expect(k8sClient.Create(ctx, s)).To(Succeed())
 
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 			sliceMetrics := expectedMetricsForSlice(s)
 			if enableSlice {
 				assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0), sliceMetrics.tpu_chip_count)
@@ -763,7 +767,7 @@ var _ = Describe("Slice Metrics Scenarios", func() {
 			By("updating the slice status to READY with reason ACTIVE")
 			updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
 			Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			sliceMetrics = expectedMetricsForSlice(s)
 			if enableSlice {
@@ -775,7 +779,7 @@ var _ = Describe("Slice Metrics Scenarios", func() {
 			By("updating the slice status to READY with reason ACTIVE_DEGRADED")
 			updateSliceStatus(s, SLICE_STATE_ACTIVE_DEGRADED, metav1.ConditionTrue)
 			Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			sliceMetrics = expectedMetricsForSlice(s)
 			if enableSlice {
@@ -788,7 +792,7 @@ var _ = Describe("Slice Metrics Scenarios", func() {
 			updateSliceStatus(s, SLICE_STATE_INCOMPLETE, metav1.ConditionFalse)
 			sliceMetrics = expectedMetricsForSlice(s)
 			Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			if enableSlice {
 				assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0), sliceMetrics.interruption_count.WithValue(1))
@@ -798,7 +802,7 @@ var _ = Describe("Slice Metrics Scenarios", func() {
 
 			By("deleting the slice")
 			Expect(k8sClient.Delete(ctx, s)).To(Succeed())
-			time.Sleep(5 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			if enableSlice {
 				assertMetricsAbsent(metricsAddr, sliceMetrics.up)
@@ -824,6 +828,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 	var s *slice.Slice
 	var restCfg *rest.Config
 	var k8sClient client.Client
+	aggregationInterval := 1
 
 	BeforeAll(func() {
 		ctx, cancel = context.WithCancel(context.Background())
@@ -832,7 +837,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 			cancel()
 			time.Sleep(3 * time.Second) // Wait for manager shutdown
 		})
-		metricsAddr = startManager(ctx, true, restCfg)
+		metricsAddr = startManager(ctx, true, restCfg, aggregationInterval)
 	})
 
 	It("should handle complex state transitions", func() {
@@ -859,7 +864,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 		updateSliceStatus(s, SLICE_STATE_ACTIVATING, metav1.ConditionFalse)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 		// Allow time for aggregation
-		time.Sleep(3 * time.Second)
+		time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 		expectedSliceMetrics := expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, expectedSliceMetrics.up.WithValue(0),
@@ -868,7 +873,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 		By("updating slice status to ACTIVE")
 		updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-		time.Sleep(3 * time.Second)
+		time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 		expectedSliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, expectedSliceMetrics.up.WithValue(1),
 			expectedSliceMetrics.interruption_count.WithValue(0))
@@ -876,7 +881,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 		By("updating slice status to ACTIVE_DEGRADED")
 		updateSliceStatus(s, SLICE_STATE_ACTIVE_DEGRADED, metav1.ConditionTrue)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-		time.Sleep(3 * time.Second)
+		time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 		expectedSliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, expectedSliceMetrics.up.WithValue(1),
 			expectedSliceMetrics.interruption_count.WithValue(0),
@@ -885,7 +890,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 		By("updating slice status to INCOMPLETE")
 		updateSliceStatus(s, SLICE_STATE_INCOMPLETE, metav1.ConditionFalse)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-		time.Sleep(3 * time.Second)
+		time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 		expectedSliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, expectedSliceMetrics.up.WithValue(0),
 			expectedSliceMetrics.interruption_count.WithValue(1))
@@ -893,7 +898,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 		By("updating slice status to ACTIVE")
 		updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-		time.Sleep(3 * time.Second)
+		time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 		expectedSliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, expectedSliceMetrics.up.WithValue(1),
 			expectedSliceMetrics.interruption_count.WithValue(1),
@@ -905,7 +910,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 			By(fmt.Sprintf("updating slice status to %s", state))
 			updateSliceStatus(s, state, metav1.ConditionFalse)
 			Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 
 			// slice metric should show down
 			expectedSliceMetrics = expectedMetricsForSlice(s)
@@ -915,7 +920,7 @@ var _ = Describe("Slice State Transition Scenarios", Ordered, func() {
 			By("updating slice status to ACTIVE")
 			updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
 			Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Duration(aggregationInterval+1) * time.Second)
 			expectedSliceMetrics = expectedMetricsForSlice(s)
 			assertMetrics(metricsAddr, expectedSliceMetrics.up.WithValue(1),
 				expectedSliceMetrics.recovery_count.WithValue(2+i))

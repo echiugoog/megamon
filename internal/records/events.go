@@ -99,8 +99,13 @@ func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummar
 			summary.LatestDownTimeBetweenRecovery = r.UpEvents[i].Timestamp.Sub(r.UpEvents[i-1].Timestamp)
 			summary.DownTime += summary.LatestDownTimeBetweenRecovery
 			summary.TotalDownTimeBetweenRecovery += summary.LatestDownTimeBetweenRecovery
-			summary.RecoveryCount++
-			summaryLog.V(5).Info("recovery event found, incrementing count")
+			// Only increment recovery count if it's NOT recovering from expected downtime.
+			if !r.UpEvents[i-1].ExpectedDown {
+				summary.RecoveryCount++
+				summaryLog.V(5).Info("recovery event found, incrementing count")
+			} else {
+				summaryLog.Info("WARNING: unexpected recovery from expected downtime event found", "upEvents", r.UpEvents)
+			}
 		} else {
 			// Just transitioned up to down.
 			summary.LatestUpTimeBetweenInterruption = r.UpEvents[i].Timestamp.Sub(r.UpEvents[i-1].Timestamp)

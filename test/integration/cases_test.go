@@ -1076,7 +1076,7 @@ var _ = Describe("Event Summarization Logic", func() {
 		t2 := t0.Add(30 * time.Minute)
 		records.AppendUpEvent(t2, &rec, false, true) // isUp=false, expected=true
 
-		// 5. T+60m: Component comes back Up
+		// 5. T+60m: Component comes back Up (no recovery)
 		t3 := t0.Add(60 * time.Minute)
 		records.AppendUpEvent(t3, &rec, true, false)
 
@@ -1096,8 +1096,8 @@ var _ = Describe("Event Summarization Logic", func() {
 		// 1. Interruption Count should be exactly 1 (the crash at T+90m).
 		Expect(summary.InterruptionCount).To(Equal(1), "InterruptionCount mismatch")
 
-		// 2. Recovery Count should be 2.
-		Expect(summary.RecoveryCount).To(Equal(2), "RecoveryCount mismatch")
+		// 2. Recovery Count should be 1.
+		Expect(summary.RecoveryCount).To(Equal(1), "RecoveryCount mismatch")
 
 		// 3. Check Downtime Durations
 		// Initial Down: t0 -> t1 = 10m

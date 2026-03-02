@@ -42,3 +42,6 @@ MegaMon was created to address shortcoming of using [kube-state-metrics](https:/
     * **GKE Mock**: Node pools are inferred from existing nodes using node
     labels. Machine type is hardcoded to `tpu7x-standard-4t` and disk size
     to `100GB`.
+
+## Experimental
+* (Untested) Set "LeaderWorkerSetEnabled" to enable support for LWS workloads

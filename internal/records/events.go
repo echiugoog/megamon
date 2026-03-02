@@ -11,6 +11,7 @@ const JobSetRecordsAnnotationKey = "megamon.tbd/records"
 
 type EventRecords struct {
 	UpEvents []UpEvent `json:"upEvents"`
+	Attrs    Attrs     `json:"attrs,omitempty"`
 }
 
 type UpEvent struct {
@@ -187,14 +188,25 @@ func ReconcileEvents(ctx context.Context, now time.Time, ups map[string]Upness, 
 			isUp = false
 		}
 
+		// Update attributes if they have changed. This ensures we have the latest
+		// metadata (like slice state or owner info) even if the upness status hasn't changed.
+		if rec.Attrs != up.Attrs {
+			reconcileLog.V(5).Info("rec.Attrs != up.Attrs, updating", "rec.Attrs", rec.Attrs, "upAttrs", up.Attrs)
+			rec.Attrs = up.Attrs // event record updates to match live state
+			changed = true
+			events[key] = rec
+		}
+
 		if AppendUpEvent(now, &rec, isUp, up.ExpectedDown) {
 			events[key] = rec
 			changed = true
 		}
 	}
 
+	// Handle items that are no longer present in the current state.
 	for key := range events {
 		if _, ok := ups[key]; !ok {
+			reconcileLog.Info("deleting metric", "key", key)
 			delete(events, key)
 			changed = true
 		}

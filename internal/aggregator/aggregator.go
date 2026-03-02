@@ -7,16 +7,15 @@ import (
 	"sync"
 	"time"
 
-	slice "example.com/megamon/copied-slice-api/v1beta1"
 	"example.com/megamon/internal/k8sutils"
 	"example.com/megamon/internal/metrics"
 	"example.com/megamon/internal/records"
 	containerv1beta1 "google.golang.org/api/container/v1beta1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
 
 type Aggregator struct {
@@ -25,13 +24,18 @@ type Aggregator struct {
 	EventsBucketName string
 	EventsBucketPath string
 
-	Interval              time.Duration
-	UnknownCountThreshold float64
-	SliceEnabled          bool
+	Interval               time.Duration
+	UnknownCountThreshold  float64
+	SliceEnabled           bool
+	LeaderWorkerSetEnabled bool
 
 	reportMtx   sync.RWMutex
 	report      records.Report
 	reportReady bool
+
+	slicesMtx    sync.RWMutex
+	SliceUpdates chan SliceUpdate
+	slicesUp     map[string]SliceState
 
 	nodePoolSchedulingMtx sync.RWMutex
 	// map[<nodepool-name>]<details-about-what-is-scheduled-on-it>
@@ -41,6 +45,57 @@ type Aggregator struct {
 
 	GKE GKEClient
 	GCS GCSClient
+}
+
+// Config holds the configuration for the Aggregator.
+type Config struct {
+	Interval               time.Duration
+	UnknownCountThreshold  float64
+	SliceEnabled           bool
+	LeaderWorkerSetEnabled bool
+	EventsBucketName       string
+	EventsBucketPath       string
+}
+
+// NewAggregator creates a new initialized Aggregator.
+func NewAggregator(c client.Client, gke GKEClient, gcs GCSClient, cfg Config) *Aggregator {
+	agg := &Aggregator{
+		Client:                 c,
+		GKE:                    gke,
+		GCS:                    gcs,
+		EventsBucketName:       cfg.EventsBucketName,
+		EventsBucketPath:       cfg.EventsBucketPath,
+		Interval:               cfg.Interval,
+		UnknownCountThreshold:  cfg.UnknownCountThreshold,
+		SliceEnabled:           cfg.SliceEnabled,
+		LeaderWorkerSetEnabled: cfg.LeaderWorkerSetEnabled,
+
+		report:             records.NewReport(),
+		slicesUp:           make(map[string]SliceState),
+		nodePoolScheduling: make(map[string]records.ScheduledJob),
+		Exporters:          make(map[string]Exporter),
+	}
+
+	if cfg.SliceEnabled {
+		agg.SliceUpdates = make(chan SliceUpdate, 100)
+	}
+
+	return agg
+}
+
+type SliceUpdate struct {
+	Name   string
+	Upness records.Upness
+	// Retain = true, to retain metrics instead of dropping them immediately. Will be used when slice gone but owner still active
+	Retain bool
+	// Delete instructs the aggregator to immediately prune this slice from memory entirely.
+	Delete bool
+}
+
+type SliceState struct {
+	Upness records.Upness
+	// Deleted = true when slice is gone but metrics are retained, will continue reporting downtime until its owner is also removed or is terminal.
+	Deleted bool
 }
 
 var log = logf.Log.WithName("aggregator")
@@ -71,20 +126,32 @@ func (a *Aggregator) Start(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case u := <-a.SliceUpdates:
+			a.slicesMtx.Lock()
+			if u.Delete {
+				log.Info("deleting slice", "name", u.Name)
+				delete(a.slicesUp, u.Name)
+			} else {
+				log.Info("updating slice", "name", u.Name, "SliceState", u)
+				a.slicesUp[u.Name] = SliceState{
+					Upness:  u.Upness,
+					Deleted: u.Retain,
+				}
+			}
+			a.slicesMtx.Unlock()
 		case <-t.C:
 			log.Info("aggregating")
-		}
+			start := time.Now()
+			if err := a.Aggregate(ctx); err != nil {
+				log.Error(err, "failed to aggregate")
+				continue
+			}
+			metrics.AggregationDuration.Record(ctx, time.Since(start).Seconds())
 
-		start := time.Now()
-		if err := a.Aggregate(ctx); err != nil {
-			log.Error(err, "failed to aggregate")
-			continue
-		}
-		metrics.AggregationDuration.Record(ctx, time.Since(start).Seconds())
-
-		for name, exporter := range a.Exporters {
-			if err := exporter.Export(ctx, a.Report()); err != nil {
-				log.Error(err, "failed to export", "exporter", name)
+			for name, exporter := range a.Exporters {
+				if err := exporter.Export(ctx, a.Report()); err != nil {
+					log.Error(err, "failed to export", "exporter", name)
+				}
 			}
 		}
 	}
@@ -96,6 +163,32 @@ func (a *Aggregator) Report() records.Report {
 	return a.report
 }
 
+func (a *Aggregator) GetSliceUpness(name string) (records.Upness, bool) {
+	a.slicesMtx.RLock()
+	defer a.slicesMtx.RUnlock()
+	state, ok := a.slicesUp[name]
+	if !ok {
+		return records.Upness{}, false
+	}
+	return state.Upness, true
+}
+
+// SetSliceUpness queues a non-blocking update to a slice state.
+func (a *Aggregator) SetSliceUpness(name string, up records.Upness, retain bool) {
+	a.SliceUpdates <- SliceUpdate{
+		Name:   name,
+		Upness: up,
+		Retain: retain,
+	}
+}
+
+func (a *Aggregator) DeleteSliceUpness(name string) {
+	a.SliceUpdates <- SliceUpdate{
+		Name:   name,
+		Delete: true,
+	}
+}
+
 func (a *Aggregator) Aggregate(ctx context.Context) error {
 	report := records.NewReport()
 
@@ -104,13 +197,31 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 		return fmt.Errorf("listing jobsets: %w", err)
 	}
 
+	var lwsList lws.LeaderWorkerSetList
+	if a.LeaderWorkerSetEnabled {
+		if err := a.List(ctx, &lwsList); err != nil {
+			return fmt.Errorf("listing leaderworkersets: %w", err)
+		}
+	}
+
 	now := time.Now()
 
 	uidMapKey := func(ns, name string) string {
 		return fmt.Sprintf("%s/%s", ns, name)
 	}
+	kindOwnerKey := func(kind, ns, name string) string {
+		return fmt.Sprintf("%s/%s/%s", strings.ToLower(kind), ns, name)
+	}
+
 	// map[<ns>/<name>]<uid>
 	uidMap := map[string]string{}
+
+	// activeSliceOwners tracks active owners to determine if a deleted slice's metrics should be retained.
+	// map[<owner-kind>/<owner-namespace>/<owner-name>]bool
+	var activeSliceOwners map[string]bool
+	if a.SliceEnabled {
+		activeSliceOwners = map[string]bool{}
+	}
 
 	for _, js := range jobsetList.Items {
 		if js.Status.TerminalState != "" {
@@ -134,6 +245,10 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 			}
 		}
 
+		if a.SliceEnabled && !isTerminal {
+			activeSliceOwners[kindOwnerKey("jobset", js.Namespace, js.Name)] = true
+		}
+
 		report.JobSetsUp[uid] = records.Upness{
 			ExpectedCount: specReplicas,
 			ReadyCount:    readyReplicas,
@@ -147,62 +262,63 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 		}
 	}
 
+	if a.LeaderWorkerSetEnabled {
+		for _, lwsObj := range lwsList.Items {
+			uid := string(lwsObj.UID)
+			attrs := extractLeaderWorkerSetAttrs(&lwsObj)
+
+			expectedReplicas := int32(1)
+			if lwsObj.Spec.Replicas != nil {
+				expectedReplicas = *lwsObj.Spec.Replicas
+			}
+
+			_, isTerminal := k8sutils.GetLeaderWorkerSetTerminalState(&lwsObj)
+			if a.SliceEnabled && !isTerminal {
+				activeSliceOwners[kindOwnerKey("leaderworkerset", lwsObj.Namespace, lwsObj.Name)] = true
+			}
+
+			report.LeaderWorkerSetsUp[uid] = records.Upness{
+				ExpectedCount: expectedReplicas,
+				ReadyCount:    lwsObj.Status.ReadyReplicas,
+				Attrs:         attrs,
+			}
+		}
+	}
+
 	var nodeList corev1.NodeList
 	if err := a.List(ctx, &nodeList); err != nil {
 		return fmt.Errorf("listing nodes: %w", err)
 	}
 
-	var sliceList slice.SliceList
+	jobsetContext := logf.IntoContext(ctx, log.WithValues("type", "jobsets"))
+	jobsetNodesContext := logf.IntoContext(ctx, log.WithValues("type", "jobset-nodes"))
+	lwsContext := logf.IntoContext(ctx, log.WithValues("type", "leader-worker-sets"))
+	nodePoolsContext := logf.IntoContext(ctx, log.WithValues("type", "nodepools"))
+	slicesContext := logf.IntoContext(ctx, log.WithValues("type", "slices"))
+
+	var sliceEvents map[string]records.EventRecords
 	if a.SliceEnabled {
-		if err := a.List(ctx, &sliceList); err != nil {
-			return fmt.Errorf("listing slices: %w", err)
+		a.slicesMtx.Lock()
+		for name, state := range a.slicesUp {
+			if state.Deleted {
+				kind := state.Upness.Attrs.SliceOwnerKind
+				ns := state.Upness.Attrs.SliceOwnerNamespace
+				ownerName := state.Upness.Attrs.SliceOwnerName
+
+				// Prune the deleted slice's metrics from memory once its owner is also deleted or reaches a terminal state.
+				if !activeSliceOwners[kindOwnerKey(kind, ns, ownerName)] {
+					delete(a.slicesUp, name)
+					continue
+				}
+			}
+			report.SlicesUp[name] = state.Upness
 		}
-		for _, s := range sliceList.Items {
-			attrs := records.Attrs{
-				SliceName:      s.Name,
-				SliceUID:       string(s.UID),
-				TPUAccelerator: string(s.Spec.Type),
-				TPUTopology:    s.Spec.Topology,
-			}
+		a.slicesMtx.Unlock()
 
-			if s.Labels != nil {
-				if val, ok := s.Labels[k8sutils.LabelTPUProvisionerOwnerName]; ok {
-					attrs.SliceOwnerName = val
-				}
-				if val, ok := s.Labels[k8sutils.LabelTPUProvisionerOwnerKind]; ok {
-					attrs.SliceOwnerKind = val
-				}
-				if val, ok := s.Labels[k8sutils.LabelTPUProvisionerOwnerNamespace]; ok {
-					attrs.SliceOwnerNamespace = val
-				}
-			}
-
-			if chipCount, err := k8sutils.GetTpuTopologyToChipCount(s.Spec.Topology); err != nil {
-				log.Error(err, "failed to convert TPU topology to chip count", "slice", s.Name)
-			} else {
-				attrs.TPUChipCount = int32(chipCount)
-			}
-
-			up := records.Upness{
-				Attrs:         attrs,
-				ExpectedCount: 1,
-			}
-
-			// Determine status
-			log.V(5).Info("DEBUG", "slice", s.Name, "status", s.Status)
-			for _, cond := range s.Status.Conditions {
-				if cond.Type == slice.SliceStateConditionType {
-					switch cond.Status {
-					case metav1.ConditionTrue:
-						up.ReadyCount = 1
-					case metav1.ConditionUnknown:
-						up.UnknownCount = 1
-					}
-					break
-				}
-			}
-
-			report.SlicesUp[s.Name] = up
+		var err error
+		sliceEvents, err = a.reconcileEvents(slicesContext, now, "slices.json", report.SlicesUp)
+		if err != nil {
+			return fmt.Errorf("reconciling slice events: %w", err)
 		}
 	}
 
@@ -299,11 +415,9 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 	if a.SliceEnabled {
 		log.V(3).Info("DEBUG", "report.SlicesUp", report.SlicesUp)
 	}
-
-	jobsetContext := logf.IntoContext(ctx, log.WithValues("type", "jobsets"))
-	jobsetNodesContext := logf.IntoContext(ctx, log.WithValues("type", "jobset-nodes"))
-	nodePoolsContext := logf.IntoContext(ctx, log.WithValues("type", "nodepools"))
-	slicesContext := logf.IntoContext(ctx, log.WithValues("type", "slices"))
+	if a.LeaderWorkerSetEnabled {
+		log.V(3).Info("DEBUG", "report.LeaderWorkerSetsUp", report.LeaderWorkerSetsUp)
+	}
 
 	jsEvents, err := a.reconcileEvents(jobsetContext, now, "jobsets.json", report.JobSetsUp)
 	if err != nil {
@@ -321,11 +435,11 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 		return fmt.Errorf("reconciling nodepool events: %w", err)
 	}
 
-	var sliceEvents map[string]records.EventRecords
-	if a.SliceEnabled {
-		sliceEvents, err = a.reconcileEvents(slicesContext, now, "slices.json", report.SlicesUp)
+	var lwsEvents map[string]records.EventRecords
+	if a.LeaderWorkerSetEnabled {
+		lwsEvents, err = a.reconcileEvents(lwsContext, now, "leader-worker-sets.json", report.LeaderWorkerSetsUp)
 		if err != nil {
-			return fmt.Errorf("reconciling slice events: %w", err)
+			return fmt.Errorf("reconciling lws events: %w", err)
 		}
 	}
 
@@ -355,6 +469,15 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 			eventSummary := events.Summarize(slicesContext, now)
 			report.SlicesUpSummaries[key] = records.UpnessSummaryWithAttrs{
 				Attrs:        report.SlicesUp[key].Attrs,
+				EventSummary: eventSummary,
+			}
+		}
+	}
+	if a.LeaderWorkerSetEnabled {
+		for key, events := range lwsEvents {
+			eventSummary := events.Summarize(lwsContext, now)
+			report.LeaderWorkerSetsUpSummaries[key] = records.UpnessSummaryWithAttrs{
+				Attrs:        report.LeaderWorkerSetsUp[key].Attrs,
 				EventSummary: eventSummary,
 			}
 		}
@@ -390,9 +513,6 @@ func (a *Aggregator) reconcileEvents(ctx context.Context, now time.Time, filenam
 func (a *Aggregator) SetNodePoolScheduling(nodePoolName string, job records.ScheduledJob) {
 	a.nodePoolSchedulingMtx.Lock()
 	defer a.nodePoolSchedulingMtx.Unlock()
-	if a.nodePoolScheduling == nil {
-		a.nodePoolScheduling = make(map[string]records.ScheduledJob)
-	}
 	a.nodePoolScheduling[nodePoolName] = job
 }
 

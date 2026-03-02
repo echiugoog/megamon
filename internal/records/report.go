@@ -4,33 +4,41 @@ import "math"
 
 func NewReport() Report {
 	return Report{
-		JobSetsUp:              make(map[string]Upness),
-		JobSetsUpSummaries:     make(map[string]UpnessSummaryWithAttrs),
-		JobSetNodesUp:          make(map[string]Upness),
-		JobSetNodesUpSummaries: make(map[string]UpnessSummaryWithAttrs),
-		NodePoolsUp:            make(map[string]Upness),
-		NodePoolsUpSummaries:   make(map[string]UpnessSummaryWithAttrs),
-		SlicesUp:               make(map[string]Upness),
-		SlicesUpSummaries:      make(map[string]UpnessSummaryWithAttrs),
+		JobSetsUp:                   make(map[string]Upness),
+		JobSetsUpSummaries:          make(map[string]UpnessSummaryWithAttrs),
+		JobSetNodesUp:               make(map[string]Upness),
+		JobSetNodesUpSummaries:      make(map[string]UpnessSummaryWithAttrs),
+		LeaderWorkerSetsUp:          make(map[string]Upness),
+		LeaderWorkerSetsUpSummaries: make(map[string]UpnessSummaryWithAttrs),
+		NodePoolsUp:                 make(map[string]Upness),
+		NodePoolsUpSummaries:        make(map[string]UpnessSummaryWithAttrs),
+		SlicesUp:                    make(map[string]Upness),
+		SlicesUpSummaries:           make(map[string]UpnessSummaryWithAttrs),
 	}
 }
 
 type Report struct {
-	JobSetsUp              map[string]Upness                 `json:"jobSetsUp"`
-	JobSetsUpSummaries     map[string]UpnessSummaryWithAttrs `json:"jobSetsUpSummaries"`
-	JobSetNodesUp          map[string]Upness                 `json:"jobSetNodesUp"`
-	JobSetNodesUpSummaries map[string]UpnessSummaryWithAttrs `json:"jobSetNodesUpSummaries"`
-	NodePoolsUp            map[string]Upness                 `json:"nodePoolsUp"`
-	NodePoolsUpSummaries   map[string]UpnessSummaryWithAttrs `json:"nodePoolsUpSummaries"`
-	SlicesUp               map[string]Upness                 `json:"slicesUp"`
-	SlicesUpSummaries      map[string]UpnessSummaryWithAttrs `json:"slicesUpSummaries"`
-	NodePoolScheduling     map[string]ScheduledJob           `json:"nodePoolScheduling"`
+	JobSetsUp                   map[string]Upness                 `json:"jobSetsUp"`
+	JobSetsUpSummaries          map[string]UpnessSummaryWithAttrs `json:"jobSetsUpSummaries"`
+	JobSetNodesUp               map[string]Upness                 `json:"jobSetNodesUp"`
+	JobSetNodesUpSummaries      map[string]UpnessSummaryWithAttrs `json:"jobSetNodesUpSummaries"`
+	LeaderWorkerSetsUp          map[string]Upness                 `json:"leaderWorkerSetsUp"`
+	LeaderWorkerSetsUpSummaries map[string]UpnessSummaryWithAttrs `json:"leaderWorkerSetsUpSummaries"`
+	NodePoolsUp                 map[string]Upness                 `json:"nodePoolsUp"`
+	NodePoolsUpSummaries        map[string]UpnessSummaryWithAttrs `json:"nodePoolsUpSummaries"`
+	SlicesUp                    map[string]Upness                 `json:"slicesUp"`
+	SlicesUpSummaries           map[string]UpnessSummaryWithAttrs `json:"slicesUpSummaries"`
+	NodePoolScheduling          map[string]ScheduledJob           `json:"nodePoolScheduling"`
 }
 
 type Attrs struct {
 	JobSetName      string `json:"jobsetName"`
 	JobSetNamespace string `json:"jobsetNamespace"`
 	JobSetUID       string `json:"jobsetUID"`
+
+	LWSName      string `json:"lwsName"`
+	LWSNamespace string `json:"lwsNamespace"`
+	LWSUID       string `json:"lwsUID"`
 
 	TPUTopology    string `json:"tpuTopology"`
 	TPUAccelerator string `json:"tpuAccelerator"`

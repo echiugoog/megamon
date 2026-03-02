@@ -50,6 +50,7 @@ import (
 	slice "example.com/megamon/copied-slice-api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
 
 var (
@@ -57,9 +58,10 @@ var (
 )
 
 func init() {
-	//utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	// register APIs with scheme, does not contact k8s API or require CRD to be present
 	utilruntime.Must(jobset.AddToScheme(scheme.Scheme))
 	utilruntime.Must(slice.AddToScheme(scheme.Scheme))
+	utilruntime.Must(lws.AddToScheme(scheme.Scheme))
 }
 
 type Config struct {
@@ -91,7 +93,8 @@ type Config struct {
 	UnknownCountThreshold float64
 
 	// HyperComputer features
-	SliceEnabled bool
+	SliceEnabled           bool
+	LeaderWorkerSetSupport bool
 }
 
 type GKEConfig struct {
@@ -148,6 +151,8 @@ func MustConfigure() Config {
 		EnableHTTP2:                 false,
 		UnknownCountThreshold:       1.0,
 		EnableSimulation:            false,
+		SliceEnabled:                false,
+		LeaderWorkerSetSupport:      false,
 	}
 
 	if err := json.Unmarshal(cfgFile, &cfg); err != nil {
@@ -339,17 +344,14 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 		}
 	}
 
-	agg := &aggregator.Aggregator{
-		Interval:              time.Duration(cfg.AggregationIntervalSeconds) * time.Second,
-		Client:                mgr.GetClient(),
-		Exporters:             map[string]aggregator.Exporter{},
-		GKE:                   gkeClient,
-		GCS:                   gcsClient,
-		EventsBucketName:      cfg.EventsBucketName,
-		EventsBucketPath:      cfg.EventsBucketPath,
-		UnknownCountThreshold: cfg.UnknownCountThreshold,
-		SliceEnabled:          cfg.SliceEnabled,
-	}
+	agg := aggregator.NewAggregator(mgr.GetClient(), gkeClient, gcsClient, aggregator.Config{
+		Interval:               time.Duration(cfg.AggregationIntervalSeconds) * time.Second,
+		UnknownCountThreshold:  cfg.UnknownCountThreshold,
+		SliceEnabled:           cfg.SliceEnabled,
+		LeaderWorkerSetEnabled: cfg.LeaderWorkerSetSupport,
+		EventsBucketName:       cfg.EventsBucketName,
+		EventsBucketPath:       cfg.EventsBucketPath,
+	})
 
 	availableExporters := map[string]aggregator.Exporter{
 		"configmap": &aggregator.ConfigMapExporter{
@@ -403,6 +405,17 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Pod")
 		os.Exit(1)
+	}
+	if cfg.SliceEnabled {
+		if err = (&controller.SliceReconciler{
+			Name:       controllerName("slice"),
+			Client:     mgr.GetClient(),
+			Scheme:     mgr.GetScheme(),
+			Aggregator: agg,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Slice")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 

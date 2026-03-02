@@ -637,6 +637,19 @@ func TestReconcileEvents(t *testing.T) {
 			unknownThreshold: 1.0,
 			expChanged:       false,
 		},
+		"deletion": {
+			inputUps: map[string]Upness{},
+			inputEvents: map[string]EventRecords{
+				"abc": {
+					UpEvents: []UpEvent{
+						{Up: true, Timestamp: now.Add(-1 * time.Minute)},
+					},
+				},
+			},
+			expEvents:        map[string]EventRecords{},
+			unknownThreshold: 1.0,
+			expChanged:       true,
+		},
 	}
 
 	ctx := context.Background()

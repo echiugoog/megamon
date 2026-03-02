@@ -10,6 +10,7 @@ import (
 	containerv1beta1 "google.golang.org/api/container/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
 
 func extractJobSetAttrs(js *jobset.JobSet) records.Attrs {
@@ -43,6 +44,40 @@ func extractJobSetAttrs(js *jobset.JobSet) records.Attrs {
 	attrs.JobSetName = js.Name
 	attrs.JobSetNamespace = js.Namespace
 	attrs.JobSetUID = string(js.UID)
+	attrs.TPUChipCount = chipCount
+
+	return attrs
+}
+
+// TODO: validate what are valid expected labels
+func extractLeaderWorkerSetAttrs(lwsObj *lws.LeaderWorkerSet) records.Attrs {
+	var attrs records.Attrs
+	var chipCount int32
+
+	// LWS has a single template for pods.
+	if lwsObj.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.NodeSelector != nil {
+		for key, val := range lwsObj.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.NodeSelector {
+			switch key {
+			case k8sutils.NodeLabelGKETPUAccelerator:
+				attrs.TPUAccelerator = val
+			case k8sutils.NodeLabelGKETPUTopology:
+				attrs.TPUTopology = val
+				if topologyChipCount, err := k8sutils.GetTpuTopologyToChipCount(val); err == nil {
+					// TODO: investigate LWS and see what makes sense
+					// LWS has replicas (or groups) and each group has a size
+					// total pods are groups * size
+					// size (leader + workers), leaders don't necessarily need to be on an accelerator
+					chipCount = *lwsObj.Spec.Replicas * int32(topologyChipCount)
+				}
+			case k8sutils.NodeLabelGKESpot:
+				attrs.Spot = val == "true"
+			}
+		}
+	}
+
+	attrs.LWSName = lwsObj.Name
+	attrs.LWSNamespace = lwsObj.Namespace
+	attrs.LWSUID = string(lwsObj.UID)
 	attrs.TPUChipCount = chipCount
 
 	return attrs

@@ -3,45 +3,15 @@ package aggregator
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	slice "example.com/megamon/copied-slice-api/v1beta1"
-	"example.com/megamon/internal/k8sutils"
 	"example.com/megamon/internal/metrics"
 	"example.com/megamon/internal/records"
 	containerv1beta1 "google.golang.org/api/container/v1beta1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 )
-
-type Aggregator struct {
-	client.Client
-
-	EventsBucketName string
-	EventsBucketPath string
-
-	Interval              time.Duration
-	UnknownCountThreshold float64
-	SliceEnabled          bool
-
-	reportMtx   sync.RWMutex
-	report      records.Report
-	reportReady bool
-
-	nodePoolSchedulingMtx sync.RWMutex
-	// map[<nodepool-name>]<details-about-what-is-scheduled-on-it>
-	nodePoolScheduling map[string]records.ScheduledJob
-
-	Exporters map[string]Exporter
-
-	GKE GKEClient
-	GCS GCSClient
-}
 
 var log = logf.Log.WithName("aggregator")
 
@@ -49,42 +19,86 @@ type GKEClient interface {
 	ListNodePools(ctx context.Context) ([]*containerv1beta1.NodePool, error)
 }
 
-type GCSClient interface {
-	GetRecords(ctx context.Context, bucket, path string) (map[string]records.EventRecords, error)
-	PutRecords(ctx context.Context, bucket, path string, recs map[string]records.EventRecords) error
-}
+type Aggregator struct {
+	client.Client
 
-type Exporter interface {
-	Export(context.Context, records.Report) error
-}
+	ResourcePoller  ResourcePoller
+	EventStore      EventStore
+	EventReconciler EventReconciler
+	SummaryProducer SummaryProducer
 
-func (a *Aggregator) ReportReady() bool {
-	a.reportMtx.RLock()
-	defer a.reportMtx.RUnlock()
-	return a.reportReady
+	EventsBucketName string
+	EventsBucketPath string
+
+	Interval               time.Duration
+	PollingInterval        time.Duration
+	UnknownCountThreshold  float64
+	SliceEnabled           bool
+	LeaderWorkerSetEnabled bool
+
+	reportMtx   sync.RWMutex
+	report      records.Report
+	reportReady bool
+
+	polledReportMtx sync.RWMutex
+	polledReport    records.Report
+
+	SliceProvider records.SliceProvider
+
+	nodePoolSchedulingMtx sync.RWMutex
+	// map[<nodepool-name>]<details-about-what-is-scheduled-on-it>
+	nodePoolScheduling map[string]records.ScheduledJob
+
+	Exporters map[string]Exporter
+	GKE       GKEClient
 }
 
 func (a *Aggregator) Start(ctx context.Context) error {
+	log.Info("starting aggregator", "interval", a.Interval, "pollingInterval", a.PollingInterval)
+
+	if a.PollingInterval > 0 {
+		go func() {
+			t := time.NewTicker(a.PollingInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					log.V(3).Info("polling resources")
+					newReport := records.NewReport()
+					if err := a.ResourcePoller.PollResources(ctx, &newReport); err != nil {
+						log.Error(err, "failed to poll resources")
+						continue
+					}
+					a.polledReportMtx.Lock()
+					a.polledReport = newReport
+					a.polledReportMtx.Unlock()
+				}
+			}
+		}()
+	}
+
 	t := time.NewTicker(a.Interval)
 	defer t.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
 			log.Info("aggregating")
-		}
+			start := time.Now()
+			if err := a.Aggregate(ctx); err != nil {
+				log.Error(err, "failed to aggregate")
+				continue
+			}
+			metrics.AggregationDuration.Record(ctx, time.Since(start).Seconds())
 
-		start := time.Now()
-		if err := a.Aggregate(ctx); err != nil {
-			log.Error(err, "failed to aggregate")
-			continue
-		}
-		metrics.AggregationDuration.Record(ctx, time.Since(start).Seconds())
-
-		for name, exporter := range a.Exporters {
-			if err := exporter.Export(ctx, a.Report()); err != nil {
-				log.Error(err, "failed to export", "exporter", name)
+			for name, exporter := range a.Exporters {
+				if err := exporter.Export(ctx, a.Report()); err != nil {
+					log.Error(err, "failed to export", "exporter", name)
+				}
 			}
 		}
 	}
@@ -96,267 +110,68 @@ func (a *Aggregator) Report() records.Report {
 	return a.report
 }
 
-func (a *Aggregator) Aggregate(ctx context.Context) error {
-	report := records.NewReport()
+func (a *Aggregator) ReportReady() bool {
+	a.reportMtx.RLock()
+	defer a.reportMtx.RUnlock()
+	return a.reportReady
+}
 
-	var jobsetList jobset.JobSetList
-	if err := a.List(ctx, &jobsetList); err != nil {
-		return fmt.Errorf("listing jobsets: %w", err)
+func (a *Aggregator) Init() {
+	a.nodePoolScheduling = make(map[string]records.ScheduledJob)
+}
+
+func (a *Aggregator) Aggregate(ctx context.Context) error {
+	var report records.Report
+	if a.PollingInterval > 0 {
+		a.polledReportMtx.RLock()
+		report = a.polledReport.Clone()
+		a.polledReportMtx.RUnlock()
+	} else {
+		report = records.NewReport()
+		if err := a.ResourcePoller.PollResources(ctx, &report); err != nil {
+			return fmt.Errorf("getting upness: %w", err)
+		}
 	}
 
 	now := time.Now()
-
-	uidMapKey := func(ns, name string) string {
-		return fmt.Sprintf("%s/%s", ns, name)
-	}
-	// map[<ns>/<name>]<uid>
-	uidMap := map[string]string{}
-
-	for _, js := range jobsetList.Items {
-		if js.Status.TerminalState != "" {
-			log.Info("jobset terminal state", "jobset", js.Name, "state", js.Status.TerminalState)
-		}
-
-		uid := string(js.UID)
-		uidMap[uidMapKey(js.Namespace, js.Name)] = uid
-
-		attrs := extractJobSetAttrs(&js)
-		specReplicas, readyReplicas := k8sutils.GetJobSetReplicas(&js)
-
-		state, isTerminal := k8sutils.GetJobSetTerminalState(&js)
-		expectedDown := false
-		if isTerminal {
-			// Completed -> Expected(Planned) Downtime (Not included in TBI)
-			// Failed -> Unplanned Downtime (Included in TBI)
-			// Suspended -> Unplanned Downtime (Included in TBI)
-			if state == jobset.JobSetCompleted {
-				expectedDown = true
-			}
-		}
-
-		report.JobSetsUp[uid] = records.Upness{
-			ExpectedCount: specReplicas,
-			ReadyCount:    readyReplicas,
-			Attrs:         attrs,
-			Status:        string(state),
-			ExpectedDown:  expectedDown,
-		}
-		report.JobSetNodesUp[uid] = records.Upness{
-			ExpectedCount: k8sutils.GetExpectedNodeCount(&js),
-			Attrs:         attrs,
-		}
-	}
-
-	var nodeList corev1.NodeList
-	if err := a.List(ctx, &nodeList); err != nil {
-		return fmt.Errorf("listing nodes: %w", err)
-	}
-
-	var sliceList slice.SliceList
-	if a.SliceEnabled {
-		if err := a.List(ctx, &sliceList); err != nil {
-			return fmt.Errorf("listing slices: %w", err)
-		}
-		for _, s := range sliceList.Items {
-			attrs := records.Attrs{
-				SliceName:      s.Name,
-				TPUAccelerator: string(s.Spec.Type),
-				TPUTopology:    s.Spec.Topology,
-			}
-
-			if s.Labels != nil {
-				if val, ok := s.Labels[k8sutils.LabelTPUProvisionerOwnerName]; ok {
-					attrs.SliceOwnerName = val
-				}
-				if val, ok := s.Labels[k8sutils.LabelTPUProvisionerOwnerKind]; ok {
-					attrs.SliceOwnerKind = val
-				}
-				if val, ok := s.Labels[k8sutils.LabelTPUProvisionerOwnerNamespace]; ok {
-					attrs.SliceOwnerNamespace = val
-				}
-			}
-
-			if chipCount, err := k8sutils.GetTpuTopologyToChipCount(s.Spec.Topology); err != nil {
-				log.Error(err, "failed to convert TPU topology to chip count", "slice", s.Name)
-			} else {
-				attrs.TPUChipCount = int32(chipCount)
-			}
-
-			up := records.Upness{
-				Attrs:         attrs,
-				ExpectedCount: 1,
-			}
-
-			// Determine status
-			log.V(5).Info("DEBUG", "slice", s.Name, "status", s.Status)
-			for _, cond := range s.Status.Conditions {
-				if cond.Type == slice.SliceStateConditionType {
-					switch cond.Status {
-					case metav1.ConditionTrue:
-						up.ReadyCount = 1
-					case metav1.ConditionUnknown:
-						up.UnknownCount = 1
-					}
-					break
-				}
-			}
-
-			report.SlicesUp[s.Name] = up
-		}
-	}
-
-	npList, err := a.GKE.ListNodePools(ctx)
-	if err != nil {
-		return fmt.Errorf("listing node pools: %w", err)
-	}
-	for _, np := range npList {
-		func() {
-			if !isTPUNodePool(np) {
-				return
-			}
-			up := records.Upness{
-				Attrs:        extractNodePoolAttrs(np),
-				Status:       np.Status,
-				ExpectedDown: np.Status == "STOPPING" || np.Status == "DELETING",
-			}
-			expectedCount, err := getExpectedTPUNodePoolSize(np)
-			if err != nil {
-				log.Error(err, "failed to get expected TPU node pool size", "nodepool", np.Name)
-				return
-			}
-			up.ExpectedCount = expectedCount
-			if tpuChipCount, err := k8sutils.GetTpuTopologyToChipCount(up.TPUTopology); err != nil {
-				log.Error(err, "failed to convert TPU topology to chip count", "nodepool", np.Name)
-			} else {
-				up.TPUChipCount = int32(tpuChipCount)
-			}
-			report.NodePoolsUp[np.Name] = up
-		}()
-	}
-
-	for _, node := range nodeList.Items {
-		nodeStatus := k8sutils.IsNodeReady(&node)
-
-		// Node pool mapping:
-
-		if npName, ok := k8sutils.GetNodePool(&node); ok {
-			func() {
-				if !k8sutils.IsTPUNode(&node) {
-					return
-				}
-				up, ok := report.NodePoolsUp[npName]
-				if !ok {
-					log.Info("WARNING: found Node for node pool that was not parsed", "node", node.Name, "nodepool", npName)
-					return
-				}
-				if up.ExpectedCount == 0 {
-					var err error
-					up.ExpectedCount, err = k8sutils.GetExpectedTPUNodePoolSize(&node)
-					if err != nil {
-						log.Error(err, "failed to get expected TPU node pool size", "node", node.Name)
-						return
-					}
-				}
-
-				if nodeStatus == corev1.ConditionTrue {
-					up.ReadyCount++
-				} else if nodeStatus == corev1.ConditionUnknown {
-					up.UnknownCount++
-				}
-				report.NodePoolsUp[npName] = up
-			}()
-		}
-
-		// Static jobset mapping:
-		if !a.SliceEnabled {
-			if jsNS, jsName := k8sutils.GetJobSetForNode(&node); jsNS != "" && jsName != "" {
-				func() {
-					if jsNS == "" || jsName == "" {
-						return
-					}
-					uid, ok := uidMap[uidMapKey(jsNS, jsName)]
-					if !ok {
-						return
-					}
-
-					up, ok := report.JobSetNodesUp[uid]
-					if !ok {
-						return
-					}
-					if nodeStatus == corev1.ConditionTrue {
-						up.ReadyCount++
-					} else if nodeStatus == corev1.ConditionUnknown {
-						up.UnknownCount++
-					}
-					report.JobSetNodesUp[uid] = up
-				}()
-			}
-		}
-	}
-
-	log.V(3).Info("DEBUG", "report.NodePoolsUp", report.NodePoolsUp, "report.JobSetNodesUp", report.JobSetNodesUp, "report.JobSetsUp", report.JobSetsUp)
-	if a.SliceEnabled {
-		log.V(3).Info("DEBUG", "report.SlicesUp", report.SlicesUp)
-	}
+	var err error
 
 	jobsetContext := logf.IntoContext(ctx, log.WithValues("type", "jobsets"))
 	jobsetNodesContext := logf.IntoContext(ctx, log.WithValues("type", "jobset-nodes"))
+	lwsContext := logf.IntoContext(ctx, log.WithValues("type", "leader-worker-sets"))
 	nodePoolsContext := logf.IntoContext(ctx, log.WithValues("type", "nodepools"))
-	slicesContext := logf.IntoContext(ctx, log.WithValues("type", "slices"))
 
-	jsEvents, err := a.reconcileEvents(jobsetContext, now, "jobsets.json", report.JobSetsUp)
+	// 1. Reconcile JobSets, NodePools, and LWS (ignore returned records)
+	_, err = a.EventReconciler.Reconcile(jobsetContext, now, "jobsets.json", report.JobSetsUp)
 	if err != nil {
 		return fmt.Errorf("reconciling jobset events: %w", err)
 	}
-	var jsNodeEvents map[string]records.EventRecords
+	// jobsetnodes only reconciled if slice is not enabled
 	if !a.SliceEnabled {
-		jsNodeEvents, err = a.reconcileEvents(jobsetNodesContext, now, "jobset-nodes.json", report.JobSetNodesUp)
+		_, err = a.EventReconciler.Reconcile(jobsetNodesContext, now, "jobset-nodes.json", report.JobSetNodesUp)
 		if err != nil {
 			return fmt.Errorf("reconciling jobset node events: %w", err)
 		}
 	}
-	nodePoolEvents, err := a.reconcileEvents(nodePoolsContext, now, "node-pools.json", report.NodePoolsUp)
+	_, err = a.EventReconciler.Reconcile(nodePoolsContext, now, "node-pools.json", report.NodePoolsUp)
 	if err != nil {
 		return fmt.Errorf("reconciling nodepool events: %w", err)
 	}
-
-	var sliceEvents map[string]records.EventRecords
-	if a.SliceEnabled {
-		sliceEvents, err = a.reconcileEvents(slicesContext, now, "slices.json", report.SlicesUp)
+	if a.LeaderWorkerSetEnabled {
+		_, err = a.EventReconciler.Reconcile(lwsContext, now, "leader-worker-sets.json", report.LeaderWorkerSetsUp)
 		if err != nil {
-			return fmt.Errorf("reconciling slice events: %w", err)
+			return fmt.Errorf("reconciling lws events: %w", err)
 		}
 	}
 
-	for key, events := range jsEvents {
-		eventSummary := events.Summarize(jobsetContext, now)
-		report.JobSetsUpSummaries[key] = records.UpnessSummaryWithAttrs{
-			Attrs:        report.JobSetsUp[key].Attrs,
-			EventSummary: eventSummary,
-		}
-	}
-	for key, events := range jsNodeEvents {
-		eventSummary := events.Summarize(jobsetNodesContext, now)
-		report.JobSetNodesUpSummaries[key] = records.UpnessSummaryWithAttrs{
-			Attrs:        report.JobSetNodesUp[key].Attrs,
-			EventSummary: eventSummary,
-		}
-	}
-	for key, events := range nodePoolEvents {
-		eventSummary := events.Summarize(nodePoolsContext, now)
-		report.NodePoolsUpSummaries[key] = records.UpnessSummaryWithAttrs{
-			Attrs:        report.NodePoolsUp[key].Attrs,
-			EventSummary: eventSummary,
-		}
-	}
+	// 2. Sync Slice states and prune those with inactive owners
 	if a.SliceEnabled {
-		for key, events := range sliceEvents {
-			eventSummary := events.Summarize(slicesContext, now)
-			report.SlicesUpSummaries[key] = records.UpnessSummaryWithAttrs{
-				Attrs:        report.SlicesUp[key].Attrs,
-				EventSummary: eventSummary,
-			}
-		}
+		a.EventReconciler.SyncSlices(a.SliceProvider, &report)
+	}
+
+	// 3. Fetch all events from GCS and Update summaries (consistent source of truth)
+	if err := a.SummaryProducer.GenerateSummaries(ctx, now, a.EventStore, a.SliceEnabled, a.LeaderWorkerSetEnabled, &report); err != nil {
+		return fmt.Errorf("producing summaries: %w", err)
 	}
 
 	a.pruneNodePoolScheduling(report.NodePoolsUp)
@@ -370,22 +185,6 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 	return nil
 }
 
-func (a *Aggregator) reconcileEvents(ctx context.Context, now time.Time, filename string, ups map[string]records.Upness) (map[string]records.EventRecords, error) {
-	path := strings.TrimSuffix(a.EventsBucketPath, "/") + "/" + filename
-	recs, err := a.GCS.GetRecords(ctx, a.EventsBucketName, path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get %q: %w", filename, err)
-	}
-
-	if changed := records.ReconcileEvents(ctx, now, ups, recs, a.UnknownCountThreshold); changed {
-		if err := a.GCS.PutRecords(ctx, a.EventsBucketName, path, recs); err != nil {
-			return nil, fmt.Errorf("failed to put %q: %w", filename, err)
-		}
-	}
-
-	return recs, nil
-}
-
 func (a *Aggregator) SetNodePoolScheduling(nodePoolName string, job records.ScheduledJob) {
 	a.nodePoolSchedulingMtx.Lock()
 	defer a.nodePoolSchedulingMtx.Unlock()
@@ -395,12 +194,12 @@ func (a *Aggregator) SetNodePoolScheduling(nodePoolName string, job records.Sche
 	a.nodePoolScheduling[nodePoolName] = job
 }
 
-func (a *Aggregator) pruneNodePoolScheduling(nps map[string]records.Upness) {
+func (a *Aggregator) pruneNodePoolScheduling(ups map[string]records.Upness) {
 	a.nodePoolSchedulingMtx.Lock()
 	defer a.nodePoolSchedulingMtx.Unlock()
-	for npName := range a.nodePoolScheduling {
-		if _, ok := nps[npName]; !ok {
-			delete(a.nodePoolScheduling, npName)
+	for k := range a.nodePoolScheduling {
+		if _, ok := ups[k]; !ok {
+			delete(a.nodePoolScheduling, k)
 		}
 	}
 }
@@ -408,6 +207,9 @@ func (a *Aggregator) pruneNodePoolScheduling(nps map[string]records.Upness) {
 func (a *Aggregator) getNodePoolScheduling() map[string]records.ScheduledJob {
 	a.nodePoolSchedulingMtx.RLock()
 	defer a.nodePoolSchedulingMtx.RUnlock()
+	if a.nodePoolScheduling == nil {
+		return nil
+	}
 	cp := make(map[string]records.ScheduledJob, len(a.nodePoolScheduling))
 	for k, v := range a.nodePoolScheduling {
 		cp[k] = v

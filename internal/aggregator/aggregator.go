@@ -30,7 +30,7 @@ type Aggregator struct {
 	EventsBucketName string
 	EventsBucketPath string
 
-	Interval               time.Duration
+	AggregationInterval    time.Duration
 	PollingInterval        time.Duration
 	UnknownCountThreshold  float64
 	SliceEnabled           bool
@@ -54,32 +54,37 @@ type Aggregator struct {
 }
 
 func (a *Aggregator) Start(ctx context.Context) error {
-	log.Info("starting aggregator", "interval", a.Interval, "pollingInterval", a.PollingInterval)
-
-	if a.PollingInterval > 0 {
-		go func() {
-			t := time.NewTicker(a.PollingInterval)
-			defer t.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.C:
-					log.V(3).Info("polling resources")
-					newReport := records.NewReport()
-					if err := a.ResourcePoller.PollResources(ctx, &newReport); err != nil {
-						log.Error(err, "failed to poll resources")
-						continue
-					}
-					a.polledReportMtx.Lock()
-					a.polledReport = newReport
-					a.polledReportMtx.Unlock()
-				}
-			}
-		}()
+	if a.PollingInterval <= 0 {
+		a.PollingInterval = a.AggregationInterval
+		log.Info("polling interval not set, defaulting to aggregation interval", "pollingInterval", a.PollingInterval)
 	}
 
-	t := time.NewTicker(a.Interval)
+	log.Info("starting aggregator", "aggregationInterval", a.AggregationInterval, "pollingInterval", a.PollingInterval)
+
+	// Optional decoupled polling loop for reading resource states independently.
+	go func() {
+		t := time.NewTicker(a.PollingInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				log.V(3).Info("polling resources")
+				newReport := records.NewReport()
+				if err := a.ResourcePoller.PollResources(ctx, &newReport); err != nil {
+					log.Error(err, "failed to poll resources")
+					continue
+				}
+				a.polledReportMtx.Lock()
+				a.polledReport = newReport
+				a.polledReportMtx.Unlock()
+			}
+		}
+	}()
+
+	// Main aggregation loop that calculates and reports metrics.
+	t := time.NewTicker(a.AggregationInterval)
 	defer t.Stop()
 
 	for {
@@ -121,17 +126,9 @@ func (a *Aggregator) Init() {
 }
 
 func (a *Aggregator) Aggregate(ctx context.Context) error {
-	var report records.Report
-	if a.PollingInterval > 0 {
-		a.polledReportMtx.RLock()
-		report = a.polledReport.Clone()
-		a.polledReportMtx.RUnlock()
-	} else {
-		report = records.NewReport()
-		if err := a.ResourcePoller.PollResources(ctx, &report); err != nil {
-			return fmt.Errorf("getting upness: %w", err)
-		}
-	}
+	a.polledReportMtx.RLock()
+	report := a.polledReport.Clone()
+	a.polledReportMtx.RUnlock()
 
 	now := time.Now()
 	var err error

@@ -109,12 +109,16 @@ func startTestEnv() (*envtest.Environment, *rest.Config, client.Client) {
 	return testEnv, cfg, k8sClient
 }
 
-func startManager(ctx context.Context, enableSlice bool, restCfg *rest.Config) string {
+func startManager(ctx context.Context, enableSlice bool, restCfg *rest.Config, aggregationPeriodOverride int) string {
 	cfg := testCfg
 	cfg.MetricsPrefix = fmt.Sprintf("megamon.test.%d", time.Now().UnixNano())
+	cfg.EventsBucketName = fmt.Sprintf("test-bucket-%d", time.Now().UnixNano())
 	cfg.OptionalControllerSuffix = cfg.MetricsPrefix
 	expectedMetricPrefix = strings.ReplaceAll(cfg.MetricsPrefix, ".", "_")
 	cfg.SliceEnabled = enableSlice
+	if aggregationPeriodOverride > 0 {
+		cfg.AggregationIntervalSeconds = int64(aggregationPeriodOverride)
+	}
 
 	// Use dynamic ports to avoid conflicts
 	cfg.MetricsAddr = fmt.Sprintf("127.0.0.1:%d", findFreePort())

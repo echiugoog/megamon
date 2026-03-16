@@ -26,7 +26,7 @@ While most resources are polled periodically, MegaMon uses native Kubernetes rec
 
 1. **Slice Reconciler (`internal/controller/slice_reconciler.go`)**
    - **Role:** Watches for Create/Update/Delete events on `Slice` custom resources.
-   - **Independence:** This is an independent worker. Whenever a slice event occurs, it lists all slices (using a direct API reader to bypass cache staleness) and performs a full reconciliation against the event history in GCS (`slices.json`).
+   - **Independence:** This is an independent worker. Whenever a slice event occurs, it lists all slices (using the standard controller-runtime cache) and performs a full reconciliation against the event history in GCS (`slices.json`).
    - **Integration:** The `Aggregator` relies on the `SliceProvider` interface (which this reconciler implements) to synchronously pull the latest in-memory slice state during its aggregation loop. The primary source of truth for historical reporting remains the GCS event store.
 
 ### Workflow
@@ -35,3 +35,67 @@ The `Aggregator.Aggregate()` method coordinates these components in a linear wor
 2. For those resource types, call the **Reconciler** to update historical events in GCS based on the current state.
 3. Delegate to the **Summary Producer** to fetch the latest historical events from GCS for all resource types (including Slices) and generate the final time-based metrics.
 4. Update the thread-safe global `Report` object for consumption by Exporters.
+
+
+### High-Level Architecture Diagram
+
+```text
+                            Kubernetes API Server
+                                     ^
+                                     | (Watches / Lists)
+  +----------------------------------|---------------------------------------+
+  |                             Controller Cache                             |
+  +----------------------------------|---------------------------------------+
+          | (List)                   | (List / Get)               | (Watch)
+          |                          |                            |
+  +-------v--------+         +-------v--------+          +--------v--------+
+  |  GKE API (GCP) |         | ResourcePoller |          | SliceReconciler |
+  +-------|--------+         +-------|--------+          +--------|--------+
+          |                          |                            |
+          | (NodePool status)        | (JobSets, LWS, Nodes)      |
+          |                          |                            |
+          |                          v                            |
+          |                  [ Raw Current State ]                |
+          |                          |                            |
+          +------------------------> |                            |
+                                     |                            |
+                                     v                            |
+                             +-------v--------+                   |
+                             |                | <-----------------+ (SyncSlices / In-Memory)
+                             |   Aggregator   |                   |
+                             |   (Main Loop)  |                   |
+                             |                |                   |
+                             +-------|--------+                   |
+                                     |                            |
+                                     | (JobSets, Nodes, etc.)     | (Slices directly)
+                                     v                            v
+                           +---------v----------------------------v---------+
+                           |                EventReconciler                 |
+                           +-------------------------|----------------------+
+                                                     |
+                                                     | (Write updated history)
+                                                     v
+                                           +---------v---------+
+                                           |  GCS Event Store  |
+                                           |   (*.json files)  |
+                                           +-------------------+
+                                                     |
+                                                     | (Fetch complete history)
+                                                     v
+                                           +---------v---------+
+                                           |  SummaryProducer  |
+                                           +---------|---------+
+                                                     |
+                                                     | (Calculates MTTR, Uptime, etc.)
+                                                     v
+                                             [ Final Report ]
+                                                     |
+                                                     v
+                                             +-------v--------+
+                                             |   Exporters    |
+                                             | (Prometheus,   |
+                                             |  ConfigMap)    |
+                                             +----------------+
+```
+
+*Note: The `SliceReconciler` calls the `EventReconciler` to update `slices.json` immediately on events, bypassing the main loop interval for lower latency metrics. The `Aggregator` also syncs the latest in-memory slice state from the `SliceReconciler` during its main loop to ensure the final report is complete.*

@@ -20,6 +20,7 @@ import (
 
 var (
 	AggregationDuration metric.Float64Histogram
+	GCSLatency          metric.Float64Histogram
 	Prefix              = "megamon"
 	log                 = logf.Log.WithName("metrics")
 )
@@ -76,6 +77,13 @@ func Init(ctx context.Context, r Reporter, interval time.Duration, unknownThresh
 	meter := otel.Meter("megamon")
 
 	var err error
+	GCSLatency, err = meter.Float64Histogram(Prefix+".gcs.latency",
+		metric.WithDescription("Duration of GCS calls."),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 2, 5),
+	)
+	fatal(err)
+
 	AggregationDuration, err = meter.Float64Histogram(Prefix+".aggregation.duration",
 		metric.WithDescription("Duration of the aggregation loop."),
 		metric.WithUnit("s"),

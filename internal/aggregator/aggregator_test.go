@@ -70,7 +70,7 @@ func TestAggregator_SeparateIntervals(t *testing.T) {
 		SummaryProducer: producer,
 		EventStore:      &mockEventReconciler{},
 		EventReconciler: &mockEventReconciler{},
-		Interval:        100 * time.Millisecond,
+		AggregationInterval: 100 * time.Millisecond,
 		PollingInterval: 10 * time.Millisecond,
 	}
 	a.Init()

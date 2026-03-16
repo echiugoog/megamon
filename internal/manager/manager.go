@@ -350,7 +350,7 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 
 	eventStore := events.NewGCSEventStore(gcsClient, cfg.EventsBucketName, cfg.EventsBucketPath)
 	agg := &aggregator.Aggregator{
-		Interval:               time.Duration(cfg.AggregationIntervalSeconds) * time.Second,
+		AggregationInterval:    time.Duration(cfg.AggregationIntervalSeconds) * time.Second,
 		Client:                 mgr.GetClient(),
 		Exporters:              map[string]aggregator.Exporter{},
 		GKE:                    gkeClient,
@@ -424,7 +424,6 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 		sliceReconciler := &controller.SliceReconciler{
 			Name:                   controllerName("slice"),
 			Client:                 mgr.GetClient(),
-			APIReader:              mgr.GetAPIReader(),
 			Scheme:                 mgr.GetScheme(),
 			EventReconciler:        agg.EventReconciler,
 			LeaderWorkerSetEnabled: cfg.LeaderWorkerSetSupport,

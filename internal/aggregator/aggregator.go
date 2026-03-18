@@ -43,6 +43,10 @@ type Aggregator struct {
 	polledReportMtx sync.RWMutex
 	polledReport    records.Report
 
+	// syncMtx ensures that the background polling routine and the main aggregation
+	// loop do not run concurrently, allowing aggregation to wait for active polls.
+	syncMtx sync.Mutex
+
 	SliceProvider records.SliceProvider
 
 	nodePoolSchedulingMtx sync.RWMutex
@@ -70,15 +74,20 @@ func (a *Aggregator) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				log.V(3).Info("polling resources")
-				newReport := records.NewReport()
-				if err := a.ResourcePoller.PollResources(ctx, &newReport); err != nil {
-					log.Error(err, "failed to poll resources")
-					continue
-				}
-				a.polledReportMtx.Lock()
-				a.polledReport = newReport
-				a.polledReportMtx.Unlock()
+				func() {
+					a.syncMtx.Lock()
+					defer a.syncMtx.Unlock()
+
+					log.V(3).Info("polling resources")
+					newReport := records.NewReport()
+					if err := a.ResourcePoller.PollResources(ctx, &newReport); err != nil {
+						log.Error(err, "failed to poll resources")
+						return
+					}
+					a.polledReportMtx.Lock()
+					a.polledReport = newReport
+					a.polledReportMtx.Unlock()
+				}()
 			}
 		}
 	}()
@@ -92,10 +101,12 @@ func (a *Aggregator) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			a.syncMtx.Lock()
 			log.Info("aggregating")
 			start := time.Now()
 			if err := a.Aggregate(ctx); err != nil {
 				log.Error(err, "failed to aggregate")
+				a.syncMtx.Unlock()
 				continue
 			}
 			metrics.AggregationDuration.Record(ctx, time.Since(start).Seconds())
@@ -105,6 +116,7 @@ func (a *Aggregator) Start(ctx context.Context) error {
 					log.Error(err, "failed to export", "exporter", name)
 				}
 			}
+			a.syncMtx.Unlock()
 		}
 	}
 }

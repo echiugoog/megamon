@@ -98,8 +98,8 @@ Ignore these labels:
 
 #### Mutation testing
 - perform mutation testing (change the test slight and re-test) on any new tests, example of some changes
- * use mutt-ng branch of go-mutesting to perform mutation tests: https://github.com/echiugoog/go-mutesting/tree/mutt-ng
-   * generate JSON and HTML report of testing using go-mutesting config file
+  - use gremlins (https://github.com/go-gremlins/gremlins) on unit tests
+  - examine output for validity and suggest remediations
 
 #### Code Quality Checks
  - run `go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -test ./...` to check for modern Go idioms

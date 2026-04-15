@@ -210,3 +210,34 @@ func TestAggregator_StartupDelay(t *testing.T) {
 		}
 	})
 }
+
+func TestAggregator_PruneNodePoolScheduling(t *testing.T) {
+	a := &Aggregator{}
+	a.Init()
+
+	a.UpdateNodePoolScheduling("np1", records.ScheduledJob{JobSetName: "js1", JobName: "j1"})
+	a.UpdateNodePoolScheduling("np2", records.ScheduledJob{JobSetName: "js2", JobName: "j2"})
+	a.UpdateNodePoolScheduling("np3", records.ScheduledJob{JobSetName: "js3", JobName: "j3"})
+
+	nps := map[string]records.Upness{
+		"np1": {ReadyCount: 1, ExpectedCount: 1},
+		"np3": {ReadyCount: 1, ExpectedCount: 1},
+	}
+
+	a.pruneNodePoolScheduling(nps)
+
+	scheduled := a.getNodePoolScheduling()
+	if len(scheduled) != 2 {
+		t.Fatalf("expected 2 scheduled nodepools, got %d", len(scheduled))
+	}
+
+	if _, ok := scheduled["np1"]; !ok {
+		t.Errorf("expected np1 to be retained")
+	}
+	if _, ok := scheduled["np3"]; !ok {
+		t.Errorf("expected np3 to be retained")
+	}
+	if _, ok := scheduled["np2"]; ok {
+		t.Errorf("expected np2 to be pruned")
+	}
+}

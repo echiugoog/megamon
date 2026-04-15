@@ -169,6 +169,7 @@ func (a *Aggregator) Aggregate(ctx context.Context) error {
 		return fmt.Errorf("generating summaries: %w", err)
 	}
 
+	a.pruneNodePoolScheduling(report.NodePoolsUp)
 	report.NodePoolScheduling = a.getNodePoolScheduling()
 
 	a.reportMtx.Lock()
@@ -188,11 +189,13 @@ func (a *Aggregator) UpdateNodePoolScheduling(nodepool string, js records.Schedu
 	a.nodePoolScheduling[nodepool] = js
 }
 
-func (a *Aggregator) DeleteNodePoolScheduling(nodepool string) {
+func (a *Aggregator) pruneNodePoolScheduling(nps map[string]records.Upness) {
 	a.nodePoolSchedulingMtx.Lock()
 	defer a.nodePoolSchedulingMtx.Unlock()
-	if a.nodePoolScheduling != nil {
-		delete(a.nodePoolScheduling, nodepool)
+	for npName := range a.nodePoolScheduling {
+		if _, ok := nps[npName]; !ok {
+			delete(a.nodePoolScheduling, npName)
+		}
 	}
 }
 

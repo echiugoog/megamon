@@ -22,7 +22,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -1069,27 +1069,19 @@ func (m metric) valueString(val any) string {
 	return fmt.Sprintf("%s %v", m.valuelessString(), val)
 }
 
+// valuelessString returns the string representation of the metric without its value,
+// including its name and formatted labels.
 func (m metric) valuelessString() string {
 	labels := make(map[string]any, len(m.labels)+2)
 	maps.Copy(labels, m.labels)
 	labels["otel_scope_name"] = "megamon"
 	labels["otel_scope_version"] = ""
-	sortedKeys := make([]string, 0, len(labels))
-	for k := range labels {
-		sortedKeys = append(sortedKeys, k)
-	}
-	sort.Strings(sortedKeys)
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "%s_%s{", expectedMetricPrefix, m.name)
-	for i, k := range sortedKeys {
-		fmt.Fprintf(&sb, "%s=\"%v\"", k, labels[k])
-		if i < len(sortedKeys)-1 {
-			sb.WriteByte(',')
-		}
+	var parts []string
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		parts = append(parts, fmt.Sprintf("%s=\"%v\"", k, labels[k]))
 	}
-	sb.WriteByte('}')
-	return sb.String()
+	return fmt.Sprintf("%s_%s{%s}", expectedMetricPrefix, m.name, strings.Join(parts, ","))
 }
 
 var _ = Describe("Event Summarization Logic", func() {

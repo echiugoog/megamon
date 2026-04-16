@@ -19,7 +19,7 @@ type EventRecords struct {
 
 type UpEvent struct {
 	Up           bool      `json:"up"`
-	ExpectedDown bool      `json:"ed,omitempty"`
+	ExpectedDown bool      `json:"expectedDown,omitempty"`
 	Timestamp    time.Time `json:"ts"`
 }
 

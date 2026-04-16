@@ -422,14 +422,6 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 	}
 	// +kubebuilder:scaffold:builder
 
-	//mgr.Add(agg)
-
-	// Initial aggregation to populate the initial metrics report.
-	// TODO: Verify the readiness check is applied before scraping.
-	//if err := agg.Aggregate(ctx); err != nil {
-	//	log.Error(err, "failed initial aggregate")
-	//}
-
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")
 		os.Exit(1)

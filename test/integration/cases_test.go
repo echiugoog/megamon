@@ -197,15 +197,11 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 		})
 
 		// Check metrics
-		// (removed redundant sleep)
-
 		It("should watch a Pod", func() {
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		})
 
 		// Check metrics
-		// (removed redundant sleep)
-
 		It("should publish nodepool metrics", func() {
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
 			assertMetrics(metricsAddr,
@@ -232,7 +228,6 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 
 			// nodepool_up should still be 0; 16x16 topology expects 256
 			By("rechecking the metrics for nodepool_up")
-			// (removed redundant sleep)
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
 			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
@@ -277,8 +272,6 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 
 		// upness validation
 		It("should update nodepool_up metric to 1 when all the nodes becomes Ready", func() {
-			// (removed redundant sleep)
-
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
 			assertMetrics(metricsAddr,
@@ -307,8 +300,6 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 				}
 			}
 			Expect(updateErr).To(BeNil())
-
-			// (removed redundant sleep)
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
@@ -339,8 +330,6 @@ var _ = Describe("Nodepool metrics", Ordered, func() {
 				}
 			}
 			Expect(updateErr).To(BeNil())
-
-			// (removed redundant sleep)
 
 			By("rechecking the metrics for nodepool_up")
 			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
@@ -785,8 +774,6 @@ var _ = Describe("Slice deletion (planned)", Ordered, func() {
 		By("creating a Slice")
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
 
-		// Allow time for aggregation
-		// (removed redundant sleep)
 		sliceMetrics := expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0))
 
@@ -795,7 +782,6 @@ var _ = Describe("Slice deletion (planned)", Ordered, func() {
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 
 		// Refresh metrics to include slice_state
-		// (removed redundant sleep)
 		By("verify slice metric shows up now")
 		sliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1))
@@ -818,7 +804,6 @@ var _ = Describe("Slice deletion (planned)", Ordered, func() {
 			return k8sClient.Get(ctx, types.NamespacedName{Name: s.Name}, s)
 		}, "3s", "10ms").ShouldNot(Succeed())
 
-		// (removed redundant sleep)
 		By("verifying metrics are gone immediately since owner is gone")
 		assertMetricsAbsent(metricsAddr, sliceMetrics.up)
 	})
@@ -870,8 +855,6 @@ var _ = Describe("Slice deletion (unplanned)", Ordered, func() {
 		By("creating a Slice")
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
 
-		// Allow time for aggregation
-		// (removed redundant sleep)
 		sliceMetrics := expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0))
 
@@ -880,7 +863,6 @@ var _ = Describe("Slice deletion (unplanned)", Ordered, func() {
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 
 		// Refresh metrics, should show as up
-		// (removed redundant sleep)
 		sliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1))
 
@@ -889,7 +871,6 @@ var _ = Describe("Slice deletion (unplanned)", Ordered, func() {
 		updateSliceStatus(s, SLICE_STATE_FAILED, metav1.ConditionFalse)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 
-		// (removed redundant sleep)
 		sliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0), sliceMetrics.interruption_count.WithValue(1))
 
@@ -906,7 +887,6 @@ var _ = Describe("Slice deletion (unplanned)", Ordered, func() {
 		js.ResourceVersion = ""
 		Expect(k8sClient.Delete(ctx, js)).To(Succeed())
 
-		// (removed redundant sleep)
 		By("verifying metrics are gone immediately since owner is gone")
 		assertMetricsAbsent(metricsAddr, sliceMetrics.up)
 	})
@@ -959,7 +939,6 @@ var _ = Describe("Slice repair", Ordered, func() {
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
 
 		// Allow time for aggregation
-		// (removed redundant sleep)
 		sliceMetrics := expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0))
 
@@ -968,7 +947,6 @@ var _ = Describe("Slice repair", Ordered, func() {
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 
 		// Refresh metrics, should show as up
-		// (removed redundant sleep)
 		sliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1))
 
@@ -977,7 +955,6 @@ var _ = Describe("Slice repair", Ordered, func() {
 		updateSliceStatus(s, SLICE_STATE_FAILED, metav1.ConditionFalse)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 
-		// (removed redundant sleep)
 		sliceMetrics = expectedMetricsForSlice(s)
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0), sliceMetrics.interruption_count.WithValue(1))
 
@@ -1002,8 +979,6 @@ var _ = Describe("Slice repair", Ordered, func() {
 		updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 
-		// Allow time for aggregation
-		// (removed redundant sleep)
 		By("verifying metrics show up and history is preserved (not pruned)")
 		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1), sliceMetrics.interruption_count.WithValue(1), sliceMetrics.recovery_count.WithValue(1))
 	})

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -32,35 +33,45 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"example.com/megamon/internal/aggregator"
+	"example.com/megamon/internal/aggregator/events"
+	"example.com/megamon/internal/aggregator/poller"
+	"example.com/megamon/internal/aggregator/report"
 	"example.com/megamon/internal/controller"
 	"example.com/megamon/internal/gcsclient"
 	"example.com/megamon/internal/gkeclient"
 	"example.com/megamon/internal/metrics"
-	"example.com/megamon/internal/records"
+	"example.com/megamon/pkg/version"
 
 	// +kubebuilder:scaffold:imports
 
+	slice "example.com/megamon/copied-slice-api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
 
 var (
-	setupLog = ctrl.Log.WithName("setup")
+	log = logf.Log.WithName("setup")
 )
 
 func init() {
-	//utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	// register APIs with scheme, does not contact k8s API or require CRD to be present
 	utilruntime.Must(jobset.AddToScheme(scheme.Scheme))
+	utilruntime.Must(slice.AddToScheme(scheme.Scheme))
+	utilruntime.Must(lws.AddToScheme(scheme.Scheme))
 }
 
 type Config struct {
 	MetricsPrefix string
+
+	OptionalControllerSuffix string
 
 	AggregationIntervalSeconds int64
 	Exporters                  []string
@@ -77,12 +88,19 @@ type Config struct {
 	ProbeAddr            string
 	SecureMetrics        bool
 	EnableHTTP2          bool
+	EnableSimulation     bool
 
 	// GKE client options
 	GKE GKEConfig
 
 	// Controller runtime thresholds
 	UnknownCountThreshold float64
+
+	// HyperComputer features
+	SliceEnabled           bool
+	LeaderWorkerSetSupport bool
+
+	SliceOwnerMapConfigMapRef types.NamespacedName
 }
 
 type GKEConfig struct {
@@ -105,15 +123,22 @@ func MustConfigure() Config {
 	opts := zap.Options{
 		Development: true,
 	}
+	var printVersion bool
+	flag.BoolVar(&printVersion, "version", false, "Print version information and exit")
 	opts.BindFlags(flag.CommandLine)
 
 	flag.Parse()
 
+	if printVersion {
+		fmt.Printf("megamon %s\n", version.String())
+		os.Exit(0)
+	}
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	cfgFile, err := os.ReadFile(configPath)
+	cfgFile, err := os.ReadFile(filepath.Clean(configPath))
 	if err != nil {
-		setupLog.Error(err, "unable to read config file")
+		log.Error(err, "unable to read config file")
 		os.Exit(1)
 	}
 	// Define config defaults.
@@ -124,6 +149,10 @@ func MustConfigure() Config {
 			Namespace: "megamon-system",
 			Name:      "megamon-report",
 		},
+		SliceOwnerMapConfigMapRef: types.NamespacedName{
+			Namespace: "megamon-system",
+			Name:      "megamon-slice-owner-map",
+		},
 		DisableNodePoolJobLabelling: true,
 		MetricsAddr:                 ":8080",
 		EnableLeaderElection:        false,
@@ -131,25 +160,32 @@ func MustConfigure() Config {
 		SecureMetrics:               true,
 		EnableHTTP2:                 false,
 		UnknownCountThreshold:       1.0,
+		EnableSimulation:            false,
+		SliceEnabled:                false,
+		LeaderWorkerSetSupport:      false,
 	}
 
 	if err := json.Unmarshal(cfgFile, &cfg); err != nil {
-		setupLog.Error(err, "unable to unmarshal config file")
+		log.Error(err, "unable to unmarshal config file")
 		os.Exit(1)
 	}
 
 	if cfg.UnknownCountThreshold < 0 || cfg.UnknownCountThreshold > 1 {
-		setupLog.Error(nil, "unknown count threshold must be between 0 and 1", "threshold", cfg.UnknownCountThreshold)
+		log.Error(nil, "unknown count threshold must be between 0 and 1", "threshold", cfg.UnknownCountThreshold)
 		os.Exit(1)
 	}
 
 	if err := configureGKE(context.Background(), &cfg.GKE); err != nil {
-		setupLog.Error(err, "unable to configure gke client")
+		log.Error(err, "unable to configure gke client")
 		os.Exit(1)
 	}
 
 	if cfg.EventsBucketPath == "" {
 		cfg.EventsBucketPath = fmt.Sprintf("megamon/clusters/%s", cfg.GKE.ClusterName)
+	}
+
+	if cfg.EnableSimulation {
+		log.Info("*** SIMULATION MODE Enabled ***")
 	}
 
 	return cfg
@@ -186,13 +222,8 @@ type GKEClient interface {
 	ListNodePools(ctx context.Context) ([]*containerv1beta1.NodePool, error)
 }
 
-type GCSClient interface {
-	GetRecords(ctx context.Context, bucket, path string) (map[string]records.EventRecords, error)
-	PutRecords(ctx context.Context, bucket, path string, recs map[string]records.EventRecords) error
-}
-
-func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient GKEClient, gcsClient GCSClient) {
-	setupLog.Info("starting manager with config", "config", cfg)
+func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient GKEClient, gcsClient gcsclient.GCSClient) {
+	log.Info("starting manager with config", "config", cfg)
 	metrics.Prefix = cfg.MetricsPrefix
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
@@ -202,7 +233,7 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
 	// - https://github.com/advisories/GHSA-4374-p667-p6c8
 	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("disabling http/2")
+		log.Info("disabling http/2")
 		c.NextProtos = []string{"http/1.1"}
 	}
 
@@ -248,13 +279,13 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 	//
 	jobsetPodSelector, err := labels.Parse("jobset.sigs.k8s.io/jobset-name, batch.kubernetes.io/job-completion-index=0")
 	if err != nil {
-		setupLog.Error(err, "unable to create jobset pod selector")
+		log.Error(err, "unable to create jobset pod selector")
 		os.Exit(1)
 	}
 	// Only watch Pods that are already scheduled to a Node.
 	scheduledPodSelector, err := fields.ParseSelector("spec.nodeName!=")
 	if err != nil {
-		setupLog.Error(err, "unable to create scheduled pod selector")
+		log.Error(err, "unable to create scheduled pod selector")
 		os.Exit(1)
 	}
 
@@ -286,14 +317,19 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		log.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	if cfg.EnableSimulation {
+		gkeClient = gkeclient.CreateStubGKEClient(mgr.GetClient())
+		gcsClient = gcsclient.CreateStubGCSClient()
 	}
 
 	if gkeClient == nil {
 		containersService, err := containerv1beta1.NewService(context.Background())
 		if err != nil {
-			setupLog.Error(err, "unable to create gke client")
+			log.Error(err, "unable to create gke client")
 			os.Exit(1)
 		}
 		gkeClient = &gkeclient.Client{
@@ -305,7 +341,7 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 	if gcsClient == nil {
 		storageClient, err := storage.NewClient(ctx)
 		if err != nil {
-			setupLog.Error(err, "unable to create gcs client")
+			log.Error(err, "unable to create gcs client")
 			os.Exit(1)
 		}
 		gcsClient = &gcsclient.Client{
@@ -313,16 +349,24 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 		}
 	}
 
+	eventStore := events.NewGCSEventStore(gcsClient, cfg.EventsBucketName, cfg.EventsBucketPath)
 	agg := &aggregator.Aggregator{
-		Interval:              time.Duration(cfg.AggregationIntervalSeconds) * time.Second,
-		Client:                mgr.GetClient(),
-		Exporters:             map[string]aggregator.Exporter{},
-		GKE:                   gkeClient,
-		GCS:                   gcsClient,
-		EventsBucketName:      cfg.EventsBucketName,
-		EventsBucketPath:      cfg.EventsBucketPath,
-		UnknownCountThreshold: cfg.UnknownCountThreshold,
+		AggregationInterval:    time.Duration(cfg.AggregationIntervalSeconds) * time.Second,
+		Client:                 mgr.GetClient(),
+		Exporters:              map[string]aggregator.Exporter{},
+		GKE:                    gkeClient,
+		EventsBucketName:       cfg.EventsBucketName,
+		EventsBucketPath:       cfg.EventsBucketPath,
+		UnknownCountThreshold:  cfg.UnknownCountThreshold,
+		SliceEnabled:           cfg.SliceEnabled,
+		LeaderWorkerSetEnabled: cfg.LeaderWorkerSetSupport,
+		NodePoller:             poller.NewNodePoller(mgr.GetClient(), gkeClient),
+		EventStore:             eventStore,
+		EventLog:               events.NewEventLogImpl(eventStore, cfg.UnknownCountThreshold),
+		SummaryProducer:        report.NewProducer(),
 	}
+
+	agg.Init()
 
 	availableExporters := map[string]aggregator.Exporter{
 		"configmap": &aggregator.ConfigMapExporter{
@@ -336,49 +380,50 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 		if exporter, ok := availableExporters[name]; ok {
 			agg.Exporters[name] = exporter
 		} else {
-			setupLog.Error(errors.New("exporter not found"), "exporter not found", "exporter", name)
+			log.Error(errors.New("exporter not found"), "exporter not found", "exporter", name)
 			os.Exit(1)
 		}
 	}
 
-	shutdownMetricsFunc := metrics.Init(ctx, agg, time.Duration(cfg.AggregationIntervalSeconds)*time.Second, cfg.UnknownCountThreshold)
+	shutdownMetricsFunc := metrics.Init(ctx, agg, time.Duration(cfg.AggregationIntervalSeconds)*time.Second, cfg.UnknownCountThreshold, cfg.SliceEnabled)
 
-	if err = (&controller.JobSetReconciler{
-		Disabled: false,
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "JobSet")
+	controllerName := func(base string) string {
+		if cfg.OptionalControllerSuffix != "" {
+			return fmt.Sprintf("%s-%s", base, cfg.OptionalControllerSuffix)
+		}
+		return base
+	}
+
+	workloadReconciler := &controller.WorkloadReconciler{
+		Name:                      controllerName("workload-reconciler"),
+		Client:                    mgr.GetClient(),
+		Scheme:                    mgr.GetScheme(),
+		EventLog:                  agg.EventLog,
+		LeaderWorkerSetEnabled:    cfg.LeaderWorkerSetSupport,
+		SliceEnabled:              cfg.SliceEnabled,
+		UnknownCountThreshold:     cfg.UnknownCountThreshold,
+		SliceOwnerMapConfigMapRef: cfg.SliceOwnerMapConfigMapRef,
+	}
+	workloadReconciler.Init()
+	if err := workloadReconciler.SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to create controller", "controller", "Workload")
 		os.Exit(1)
 	}
-	if err = (&controller.NodeReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Node")
-		os.Exit(1)
-	}
+
 	if err = (&controller.PodReconciler{
+		Name:                        controllerName("pod"),
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
 		Aggregator:                  agg,
 		DisableNodePoolJobLabelling: cfg.DisableNodePoolJobLabelling,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Pod")
+		log.Error(err, "unable to create controller", "controller", "Pod")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
 
-	//mgr.Add(agg)
-
-	// Initial aggregation to populate the initial metrics report.
-	// TODO: Verify the readiness check is applied before scraping.
-	//if err := agg.Aggregate(ctx); err != nil {
-	//	setupLog.Error(err, "failed initial aggregate")
-	//}
-
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+		log.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", func(req *http.Request) error {
@@ -387,7 +432,7 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 		}
 		return nil
 	}); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+		log.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
 
@@ -401,47 +446,45 @@ func MustRun(ctx context.Context, cfg Config, restConfig *rest.Config, gkeClient
 		}
 		promHandler.ServeHTTP(w, r)
 	}))
-	metricsServer := http.Server{Handler: metricsMux, Addr: cfg.MetricsAddr}
+	metricsServer := http.Server{
+		Handler:           metricsMux,
+		Addr:              cfg.MetricsAddr,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
 
 	var wg sync.WaitGroup
 
-	mgr.Add(agg)
-	//wg.Add(1)
-	//go func() {
-	//	log.Println("starting aggregator")
-	//	defer wg.Done()
-	//	if err := agg.Start(ctx); err != nil {
-	//		if errors.Is(err, context.Canceled) {
-	//			setupLog.Info("aggregator - context cancelled")
-	//		} else {
-	//			setupLog.Error(err, "aggregator error")
-	//			os.Exit(1)
-	//		}
-	//	}
-	//}()
+	if err := mgr.Add(agg); err != nil {
+		log.Error(err, "unable to add aggregator to manager")
+		os.Exit(1)
+	}
 
-	wg.Add(1)
-	go func() {
-		setupLog.Info("starting metrics server")
-		defer wg.Done()
+	wg.Go(func() {
+		log.Info("starting metrics server")
 		if err := metricsServer.ListenAndServe(); err != nil {
 			if errors.Is(err, http.ErrServerClosed) {
-				setupLog.Info("metrics server closed")
-			} else if !errors.Is(err, context.Canceled) {
-				setupLog.Info("metrics server - context cancelled")
+				log.Info("metrics server closed")
+			} else if errors.Is(err, context.Canceled) {
+				log.Info("metrics server - context cancelled")
 			} else {
-				setupLog.Error(err, "metrics server error")
+				log.Error(err, "metrics server error")
 				os.Exit(1)
 			}
 		}
-	}()
-	setupLog.Info("starting manager")
-	if err := mgr.Start(ctx); err != nil {
-		setupLog.Error(err, "problem running manager")
-	}
-	metricsServer.Shutdown(context.Background())
+	})
 
-	setupLog.Info("waiting for all goroutines to stop")
+	log.Info("starting manager")
+	if err := mgr.Start(ctx); err != nil {
+		log.Error(err, "problem running manager")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Error(err, "failed to shutdown metrics server")
+	}
+
+	log.Info("waiting for all goroutines to stop")
 	wg.Wait()
-	setupLog.Info("all goroutines stopped, exiting")
+	log.Info("all goroutines stopped, exiting")
 }

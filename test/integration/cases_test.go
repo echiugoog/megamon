@@ -20,22 +20,38 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
 	"example.com/megamon/internal/k8sutils"
+	"example.com/megamon/internal/records"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	containerv1beta1 "google.golang.org/api/container/v1beta1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+
+	slice "example.com/megamon/copied-slice-api/v1beta1"
+)
+
+const (
+	SLICE_STATE_ACTIVATING                = "ACTIVATING"
+	SLICE_STATE_ACTIVE                    = "ACTIVE"
+	SLICE_STATE_ACTIVE_DEGRADED           = "ACTIVE_DEGRADED"
+	SLICE_STATE_INCOMPLETE                = "INCOMPLETE"
+	SLICE_STATE_FAILED                    = "FAILED"
+	SLICE_STATE_UNKNOWN                   = "UNKNOWN"
+	SLICE_STATE_HEALTH_STATUS_UNSPECIFIED = "HEALTH_STATUS_UNSPECIFIED"
 )
 
 var (
@@ -110,10 +126,25 @@ var (
 	}
 )
 
-var _ = Describe("Nodepool metrics", func() {
-	Context("When reconciling a resource", func() {
-		ctx := context.Background()
+var _ = Describe("Nodepool metrics", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var restCfg *rest.Config
+	var k8sClient client.Client
 
+	aggregationInterval := 1
+
+	BeforeAll(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		_, restCfg, k8sClient = startTestEnv()
+		DeferCleanup(func() {
+			stopManager(cancel, metricsAddr)
+		})
+		metricsAddr = startManager(ctx, false, restCfg, aggregationInterval)
+	})
+
+	Context("When reconciling a resource", func() {
 		jsRef := types.NamespacedName{
 			Name:      "test-jobset",
 			Namespace: "default",
@@ -165,21 +196,15 @@ var _ = Describe("Nodepool metrics", func() {
 			Expect(k8sClient.Create(ctx, node)).To(Succeed())
 		})
 
-		// Necessary because pod reconciler uses a cached client
-		// which is eventually consistent w k8sClient here
-		time.Sleep(5 * time.Second)
-
+		// Check metrics
 		It("should watch a Pod", func() {
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		})
 
-		// Necessary because pod reconciler uses a cached client
-		// which is eventually consistent w k8sClient here
-		time.Sleep(5 * time.Second)
-
+		// Check metrics
 		It("should publish nodepool metrics", func() {
-			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
+			assertMetrics(metricsAddr,
 				// Depends on node and jobset pod being created
 				nodepool.job_scheduled.WithValue(1),
 				// Only depend on nodepool being created
@@ -203,9 +228,8 @@ var _ = Describe("Nodepool metrics", func() {
 
 			// nodepool_up should still be 0; 16x16 topology expects 256
 			By("rechecking the metrics for nodepool_up")
-			time.Sleep(3 * time.Second)
-			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(0),
@@ -248,12 +272,9 @@ var _ = Describe("Nodepool metrics", func() {
 
 		// upness validation
 		It("should update nodepool_up metric to 1 when all the nodes becomes Ready", func() {
-			// Allow time for aggregation (1s interval) and metric update
-			time.Sleep(3 * time.Second)
-
 			By("rechecking the metrics for nodepool_up")
-			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(0),
@@ -280,12 +301,9 @@ var _ = Describe("Nodepool metrics", func() {
 			}
 			Expect(updateErr).To(BeNil())
 
-			// Allow time for aggregation (1s interval) and metric update
-			time.Sleep(3 * time.Second)
-
 			By("rechecking the metrics for nodepool_up")
-			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(1),
@@ -313,12 +331,9 @@ var _ = Describe("Nodepool metrics", func() {
 			}
 			Expect(updateErr).To(BeNil())
 
-			// Allow time for aggregation (1s interval) and metric update
-			time.Sleep(3 * time.Second)
-
 			By("rechecking the metrics for nodepool_up")
-			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name)
-			assertMetrics(
+			nodepool := expectedMetricsForNodePool(np, jsRef.Name, jobRef.Name, "")
+			assertMetrics(metricsAddr,
 				nodepool.job_scheduled.WithValue(1),
 				nodepool.down_time_seconds,
 				nodepool.interruption_count.WithValue(1),
@@ -327,32 +342,38 @@ var _ = Describe("Nodepool metrics", func() {
 				nodepool.up_time_seconds,
 				nodepool.tpu_chip_count.WithValue(256),
 			)
-
 		})
 
 	})
 })
 
-var _ = Describe("JobSet metrics", func() {
+var _ = Describe("JobSet metrics", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var restCfg *rest.Config
+	var k8sClient client.Client
+	aggregationInterval := 1
+	BeforeAll(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		_, restCfg, k8sClient = startTestEnv()
+		DeferCleanup(func() {
+			stopManager(cancel, metricsAddr)
+		})
+		metricsAddr = startManager(ctx, false, restCfg, aggregationInterval)
+	})
+
 	Context("When reconciling a resource", func() {
-		ctx := context.Background()
-
-		//BeforeEach(func() {
-		//})
-
-		//AfterEach(func() {
-		//	By("Cleanup the specific resource instance")
-		//	Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		//})
-
-		js := jobsetSingleJob
+		js := jobsetSingleJob.DeepCopy()
+		js.ResourceVersion = ""
+		js.UID = ""
 		It("should watch a JobSet", func() {
 			Expect(k8sClient.Create(ctx, js)).To(Succeed())
 		})
 
 		It("should publish metrics after submitting a jobset", func() {
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(0),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -374,7 +395,7 @@ var _ = Describe("JobSet metrics", func() {
 
 			By("rechecking the metrics")
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(1),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -397,7 +418,7 @@ var _ = Describe("JobSet metrics", func() {
 
 			By("rechecking the metrics")
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(0),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -423,7 +444,7 @@ var _ = Describe("JobSet metrics", func() {
 
 			By("rechecking the metrics")
 			jobset := expectedMetricsForJobSet(js, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				jobset.up.WithValue(1),
 				jobset.up_time_seconds,
 				jobset.down_time_seconds,
@@ -440,16 +461,82 @@ var _ = Describe("JobSet metrics", func() {
 			)
 		})
 
+		It("should publish build info metric", func() {
+			By("checking for megamon_build_info metric")
+			metrics := expectedMetricPrefix + "_build_info{commit=\"none\",date=\"unknown\",otel_scope_name=\"megamon\",otel_scope_version=\"\",version=\"dev\"} 1"
+			Eventually(func() (string, error) {
+				return fetchMetrics(metricsAddr)
+			}, "3s", "10ms").Should(ContainSubstring(metrics))
+		})
+
+		It("should NOT increment interruption count when jobset completes (expected downtime)", func() {
+			By("setting the jobset status to Completed")
+			js.Status.TerminalState = string(jobset.JobSetCompleted)
+			js.Status.Conditions = []metav1.Condition{
+				{
+					Type:               string(jobset.JobSetCompleted),
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: metav1.Now(),
+					Reason:             "AllJobsCompleted",
+					Message:            "jobset completed",
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, js)).To(Succeed())
+
+			By("checking that interruption count is still 1")
+			// We iterate a few times to ensure the aggregator picks it up and DOES NOT increment
+			metrics := expectedMetricsForJobSet(js, "2x4")
+
+			// 1. Wait for the aggregator to pick up the "Completed" state (Up -> 0)
+			Eventually(func(g Gomega) {
+				m, err := fetchMetrics(metricsAddr)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(m).To(ContainSubstring(metrics.up.WithValue(0).String()))
+			}, "3s", "10ms").Should(Succeed())
+
+			// 2. Ensure Interruption Count remains 1 (Expected Downtime should NOT increment it)
+			Consistently(func(g Gomega) {
+				m, err := fetchMetrics(metricsAddr)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(m).To(ContainSubstring(metrics.interruption_count.WithValue(1).String()))
+			}, "3s", "10ms").Should(Succeed())
+		})
+
 		It("should watch a jobset with a two replicated jobs", func() {
 			Expect(k8sClient.Create(ctx, jobsetMultipleRJobs)).To(Succeed())
 		})
 		It("should publish total TPU chip counts by jobset with multiple replicated jobs with >1 replica", func() {
 			By("looking at TPU topology per replicated job in a deployed jobset")
 			metrics := expectedMetricsForJobSet(jobsetMultipleRJobs, "2x4")
-			assertMetrics(
+			assertMetrics(metricsAddr,
 				metrics.tpu_chip_count.WithValue(24),
 			)
 		})
+	})
+})
+
+var _ = Describe("JobSet Node metrics absent when slice is enabled", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var restCfg *rest.Config
+	aggregationInterval := 1
+
+	BeforeAll(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		_, restCfg, _ = startTestEnv()
+		DeferCleanup(func() {
+			stopManager(cancel, metricsAddr)
+		})
+		metricsAddr = startManager(ctx, true, restCfg, aggregationInterval)
+	})
+
+	It("should not publish any jobset node metrics when slice is enabled", func() {
+		By("checking that no jobset node metrics are published")
+		unexpectedMetricPrefix := "jobset_node_"
+		Eventually(func() (string, error) {
+			return fetchMetrics(metricsAddr)
+		}, "3s", "10ms").ShouldNot(ContainSubstring(unexpectedMetricPrefix))
 	})
 })
 
@@ -485,11 +572,14 @@ type utilizationMetrics struct {
 	job_scheduled metric
 }
 
-func expectedMetricsForNodePool(np *containerv1beta1.NodePool, jobSetName string, jobName string) utilizationMetrics {
+func expectedMetricsForNodePool(np *containerv1beta1.NodePool, jobSetName string, jobName string, sliceName string) utilizationMetrics {
 	nodepoolLabels := map[string]interface{}{
 		"nodepool_name":   np.Name,
 		"tpu_topology":    tpuTopology,
 		"tpu_accelerator": tpuAccelerator,
+	}
+	if sliceName != "" {
+		nodepoolLabels["slice_name"] = sliceName
 	}
 	nodepoolJobLabels := map[string]interface{}{
 		"job_name":      jobName,
@@ -529,12 +619,20 @@ func expectedMetricsForNodePool(np *containerv1beta1.NodePool, jobSetName string
 }
 
 func expectedMetricsForJobSet(js *jobset.JobSet, tpuTopology string) upnessMetrics {
-	// megamon_test_jobset_up{jobset_name="test-js",jobset_namespace="default",jobset_uid="a9876d7f-4639-41a3-9961-9ac68e0fcb7b",otel_scope_name="megamon",otel_scope_version=""} 0
+	return expectedMetricsForJobSetWithSlice(js, tpuTopology, nil)
+}
+
+func expectedMetricsForJobSetWithSlice(js *jobset.JobSet, tpuTopology string, sl *slice.Slice) upnessMetrics {
 	jsLabels := map[string]interface{}{
 		"jobset_name":      js.Name,
 		"jobset_namespace": js.Namespace,
 		"jobset_uid":       js.UID,
 		"tpu_topology":     tpuTopology,
+	}
+	if sl != nil {
+		if sl.Name != "" {
+			jsLabels["slice_name"] = sl.Name
+		}
 	}
 	return upnessMetrics{
 		up: metric{
@@ -592,8 +690,303 @@ func expectedMetricsForJobSet(js *jobset.JobSet, tpuTopology string) upnessMetri
 	}
 }
 
-func fetchMetrics() (string, error) {
-	resp, err := http.Get("http://" + testCfg.MetricsAddr + "/metrics")
+func updateSliceStatus(s *slice.Slice, reason string, status metav1.ConditionStatus) {
+	if len(s.Status.Conditions) == 0 {
+		s.Status.Conditions = []metav1.Condition{{Type: slice.SliceStateConditionType}}
+	}
+	s.Status.Conditions[0].Type = slice.SliceStateConditionType
+	s.Status.Conditions[0].Reason = reason
+	s.Status.Conditions[0].Status = status
+	s.Status.Conditions[0].LastTransitionTime = metav1.Now()
+}
+
+func expectedMetricsForSlice(s *slice.Slice) upnessMetrics {
+	sLabels := map[string]interface{}{
+		"slice_name":            s.Name,
+		"slice_owner_name":      s.Labels["tpu-provisioner.cloud.google.com/owner-name"],
+		"slice_owner_namespace": s.Labels["tpu-provisioner.cloud.google.com/owner-namespace"],
+		"slice_owner_kind":      s.Labels["tpu-provisioner.cloud.google.com/owner-kind"],
+		"tpu_accelerator":       string(s.Spec.Type),
+		"tpu_topology":          s.Spec.Topology,
+	}
+	chipCount, _ := k8sutils.GetTpuTopologyToChipCount(s.Spec.Topology)
+	return upnessMetrics{
+		up:                                   metric{name: "slice_up", labels: sLabels},
+		interruption_count:                   metric{name: "slice_interruption_count", labels: sLabels},
+		recovery_count:                       metric{name: "slice_recovery_count", labels: sLabels},
+		up_time_seconds:                      metric{name: "slice_up_time_seconds", labels: sLabels},
+		down_time_seconds:                    metric{name: "slice_down_time_seconds", labels: sLabels},
+		tpu_chip_count:                       metric{name: "slice_tpu_chip_count", labels: sLabels}.WithValue(chipCount),
+		up_time_between_interruption_seconds: metric{name: "slice_up_time_between_interruption_seconds", labels: sLabels},
+		up_time_between_interruption_mean_seconds:   metric{name: "slice_up_time_between_interruption_mean_seconds", labels: sLabels},
+		up_time_between_interruption_latest_seconds: metric{name: "slice_up_time_between_interruption_latest_seconds", labels: sLabels},
+		down_time_initial_seconds:                   metric{name: "slice_down_time_initial_seconds", labels: sLabels},
+		down_time_between_recovery_seconds:          metric{name: "slice_down_time_between_recovery_seconds", labels: sLabels},
+		down_time_between_recovery_mean_seconds:     metric{name: "slice_down_time_between_recovery_mean_seconds", labels: sLabels},
+		down_time_between_recovery_latest_seconds:   metric{name: "slice_down_time_between_recovery_latest_seconds", labels: sLabels},
+	}
+}
+
+var _ = Describe("Slice deletion (planned)", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var s *slice.Slice
+	var restCfg *rest.Config
+	var k8sClient client.Client
+
+	const aggregationTime = 2
+
+	BeforeEach(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		_, restCfg, k8sClient = startTestEnv()
+		DeferCleanup(func() {
+			stopManager(cancel, metricsAddr)
+		})
+
+		metricsAddr = startManager(ctx, true, restCfg, aggregationTime)
+		s = &slice.Slice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "slice",
+				Labels: map[string]string{
+					"tpu-provisioner.cloud.google.com/owner-name":      "test-owner",
+					"tpu-provisioner.cloud.google.com/owner-namespace": "default",
+					"tpu-provisioner.cloud.google.com/owner-kind":      "JobSet",
+				},
+			},
+			Spec: slice.SliceSpec{
+				Type:         slice.TypeTpu7x,
+				Topology:     "2x2x2",
+				PartitionIds: []string{"p1"},
+			},
+		}
+	})
+
+	It("should not mark a slice deletion as an interruption (if planned)", func() {
+		By("creating the JobSet owner")
+		js := jobsetSingleJob.DeepCopy()
+		js.ResourceVersion = ""
+		js.UID = ""
+		js.Name = "test-owner"
+		js.Namespace = "default"
+		Expect(k8sClient.Create(ctx, js)).To(Succeed())
+
+		By("creating a Slice")
+		Expect(k8sClient.Create(ctx, s)).To(Succeed())
+
+		sliceMetrics := expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0))
+
+		By("updating the slice READY condition == True, slice state == ACTIVE")
+		updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
+		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
+
+		// Refresh metrics to include slice_state
+		By("verify slice metric shows up now")
+		sliceMetrics = expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1))
+
+		By("deleting the JobSet owner")
+		js.ResourceVersion = "" // Reset for deletion just in case
+		Expect(k8sClient.Delete(ctx, js)).To(Succeed())
+
+		By("waiting for JobSet to be deleted")
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: js.Name}, js)
+		}, "3s", "10ms").ShouldNot(Succeed())
+
+		By("deleting the slice")
+		Expect(k8sClient.Delete(ctx, s)).To(Succeed())
+
+		// Wait for deletion to complete
+		By("waiting for slice to be deleted")
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: s.Name}, s)
+		}, "3s", "10ms").ShouldNot(Succeed())
+
+		By("verifying metrics are gone immediately since owner is gone")
+		assertMetricsAbsent(metricsAddr, sliceMetrics.up)
+	})
+})
+
+var _ = Describe("Slice deletion (unplanned)", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var s *slice.Slice
+	var restCfg *rest.Config
+	var k8sClient client.Client
+
+	const aggregationTime = 2
+
+	BeforeEach(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		_, restCfg, k8sClient = startTestEnv()
+		DeferCleanup(func() {
+			stopManager(cancel, metricsAddr)
+		})
+
+		metricsAddr = startManager(ctx, true, restCfg, aggregationTime)
+		s = &slice.Slice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "slice",
+				Labels: map[string]string{
+					"tpu-provisioner.cloud.google.com/owner-name":      "test-owner",
+					"tpu-provisioner.cloud.google.com/owner-namespace": "default",
+					"tpu-provisioner.cloud.google.com/owner-kind":      "JobSet",
+				},
+			},
+			Spec: slice.SliceSpec{
+				Type:         slice.TypeTpu7x,
+				Topology:     "2x2x2",
+				PartitionIds: []string{"p1"},
+			},
+		}
+	})
+	It("should not mark a slice deletion as interruption (if unplanned)", func() {
+		By("creating the JobSet owner")
+		js := jobsetSingleJob.DeepCopy()
+		js.ResourceVersion = ""
+		js.UID = ""
+		js.Name = "test-owner"
+		js.Namespace = "default"
+		Expect(k8sClient.Create(ctx, js)).To(Succeed())
+
+		By("creating a Slice")
+		Expect(k8sClient.Create(ctx, s)).To(Succeed())
+
+		sliceMetrics := expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0))
+
+		By("updating the slice READY condition == True, slice state == ACTIVE")
+		updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
+		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
+
+		// Refresh metrics, should show as up
+		sliceMetrics = expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1))
+
+		// Set slice Ready to Flase
+		By("updating slice READY condition == False")
+		updateSliceStatus(s, SLICE_STATE_FAILED, metav1.ConditionFalse)
+		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
+
+		sliceMetrics = expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0), sliceMetrics.interruption_count.WithValue(1))
+
+		By("deleting the slice")
+		Expect(k8sClient.Delete(ctx, s)).To(Succeed())
+
+		// Wait for deletion to complete
+		By("waiting for slice to be deleted")
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: s.Name}, s)
+		}, "3s", "10ms").ShouldNot(Succeed())
+
+		By("deleting the JobSet owner")
+		js.ResourceVersion = ""
+		Expect(k8sClient.Delete(ctx, js)).To(Succeed())
+
+		By("verifying metrics are gone immediately since owner is gone")
+		assertMetricsAbsent(metricsAddr, sliceMetrics.up)
+	})
+})
+
+var _ = Describe("Slice repair", Ordered, func() {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var metricsAddr string
+	var s *slice.Slice
+	var restCfg *rest.Config
+	var k8sClient client.Client
+
+	const aggregationTime = 2
+
+	BeforeEach(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		_, restCfg, k8sClient = startTestEnv()
+		DeferCleanup(func() {
+			stopManager(cancel, metricsAddr)
+		})
+
+		metricsAddr = startManager(ctx, true, restCfg, aggregationTime)
+		s = &slice.Slice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "slice",
+				Labels: map[string]string{
+					"tpu-provisioner.cloud.google.com/owner-name":      "test-owner",
+					"tpu-provisioner.cloud.google.com/owner-namespace": "default",
+					"tpu-provisioner.cloud.google.com/owner-kind":      "JobSet",
+				},
+			},
+			Spec: slice.SliceSpec{
+				Type:         slice.TypeTpu7x,
+				Topology:     "2x2x2",
+				PartitionIds: []string{"p1"},
+			},
+		}
+	})
+	It("show an interruption and recovery on slice re-creation with same name within grace period", func() {
+		By("creating the JobSet owner")
+		js := jobsetSingleJob.DeepCopy()
+		js.ResourceVersion = ""
+		js.UID = ""
+		js.Name = "test-owner"
+		js.Namespace = "default"
+		Expect(k8sClient.Create(ctx, js)).To(Succeed())
+
+		By("creating a Slice")
+		Expect(k8sClient.Create(ctx, s)).To(Succeed())
+
+		// Allow time for aggregation
+		sliceMetrics := expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0))
+
+		By("updating the slice READY condition == True, slice state == ACTIVE")
+		updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
+		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
+
+		// Refresh metrics, should show as up
+		sliceMetrics = expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1))
+
+		// Set slice Ready to Flase
+		By("updating slice READY condition == False")
+		updateSliceStatus(s, SLICE_STATE_FAILED, metav1.ConditionFalse)
+		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
+
+		sliceMetrics = expectedMetricsForSlice(s)
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(0), sliceMetrics.interruption_count.WithValue(1))
+
+		// repair flow, scheduler observes slice READY==false
+		// scheduler deletes slice and recreates with same name with healthy partitions
+		By("deleting the slice")
+		Expect(k8sClient.Delete(ctx, s)).To(Succeed())
+
+		// Wait for deletion to complete
+		By("waiting for slice to be deleted")
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: s.Name}, s)
+		}, "3s", "10ms").ShouldNot(Succeed())
+
+		By("re-creating slice with same name")
+		s.ResourceVersion = "" // Reset for recreation
+		s.UID = ""
+		s.DeletionTimestamp = nil
+		Expect(k8sClient.Create(ctx, s)).To(Succeed())
+
+		By("updating the slice READY condition == True, slice state == ACTIVE")
+		updateSliceStatus(s, SLICE_STATE_ACTIVE, metav1.ConditionTrue)
+		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
+
+		By("verifying metrics show up and history is preserved (not pruned)")
+		assertMetrics(metricsAddr, sliceMetrics.up.WithValue(1), sliceMetrics.interruption_count.WithValue(1), sliceMetrics.recovery_count.WithValue(1))
+	})
+
+})
+
+func fetchMetrics(addr string) (string, error) {
+	resp, err := http.Get("http://" + addr + "/metrics")
 	if err != nil {
 		return "", err
 	}
@@ -605,39 +998,36 @@ func fetchMetrics() (string, error) {
 	return string(body), nil
 }
 
-func assertMetrics(expected ...metric) {
+func assertMetrics(addr string, expected ...metric) {
 	GinkgoHelper()
-	var metrics string
-	Eventually(func() (string, error) {
-		var err error
-		metrics, err = fetchMetrics()
-		return metrics, err
-	}, "3s", "1s").Should(ContainSubstring(expected[0].String()), "initial metric not found")
-	for _, exp := range expected {
-		Expect(metrics).To(ContainSubstring(exp.name+"{"), "metric name")
-		line := findMatchingLine(metrics, exp.name+"{")
-		//fmt.Println("-----------------------")
-		//fmt.Println(metrics)
-		Expect(metrics).To(ContainSubstring(exp.String()), "full metric does not match: "+line)
-	}
+	Eventually(func(g Gomega) {
+		metrics, err := fetchMetrics(addr)
+		g.Expect(err).NotTo(HaveOccurred())
+		for _, exp := range expected {
+			g.Expect(metrics).To(ContainSubstring(exp.name+"{"), "metric name not found: %s", exp.name)
+			g.Expect(metrics).To(ContainSubstring(exp.String()), "full metric does not match: %s", exp.String())
+		}
+	}, "5s", "100ms").Should(Succeed())
 }
 
-func findMatchingLine(lines, match string) string {
-	for _, line := range strings.Split(lines, "\n") {
-		if strings.HasPrefix(line, match) {
-			return line
+func assertMetricsAbsent(addr string, expected ...metric) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		metrics, err := fetchMetrics(addr)
+		g.Expect(err).NotTo(HaveOccurred())
+		for _, exp := range expected {
+			g.Expect(metrics).NotTo(ContainSubstring(exp.name+"{"), "metric found but should be absent: %s", exp.name)
 		}
-	}
-	return ""
+	}, "5s", "100ms").Should(Succeed())
 }
 
 type metric struct {
 	name   string
-	labels map[string]interface{}
-	value  interface{}
+	labels map[string]any
+	value  any
 }
 
-func (m metric) WithValue(val interface{}) metric {
+func (m metric) WithValue(val any) metric {
 	cp := m
 	cp.value = val
 	return cp
@@ -650,30 +1040,80 @@ func (m metric) String() string {
 	return m.valuelessString()
 }
 
-func (m metric) valueString(val interface{}) string {
-	return fmt.Sprintf("%s %d", m.valuelessString(), val)
+func (m metric) valueString(val any) string {
+	return fmt.Sprintf("%s %v", m.valuelessString(), val)
 }
 
+// valuelessString returns the string representation of the metric without its value,
+// including its name and formatted labels.
 func (m metric) valuelessString() string {
-	var labels = make(map[string]interface{}, len(m.labels))
-	for k, v := range m.labels {
-		labels[k] = v
-	}
+	labels := make(map[string]any, len(m.labels)+2)
+	maps.Copy(labels, m.labels)
 	labels["otel_scope_name"] = "megamon"
 	labels["otel_scope_version"] = ""
-	sortedKeys := make([]string, 0, len(labels))
-	for k := range labels {
-		sortedKeys = append(sortedKeys, k)
-	}
-	sort.Strings(sortedKeys)
 
-	str := expectedMetricPrefix + "_" + m.name + "{"
-	for i, k := range sortedKeys {
-		str += fmt.Sprintf("%s=\"%v\"", k, labels[k])
-		if i < len(sortedKeys)-1 {
-			str += ","
-		}
+	var parts []string
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		parts = append(parts, fmt.Sprintf("%s=\"%v\"", k, labels[k]))
 	}
-	str += "}"
-	return str
+	return fmt.Sprintf("%s_%s{%s}", expectedMetricPrefix, m.name, strings.Join(parts, ","))
 }
+
+var _ = Describe("Event Summarization Logic", func() {
+	It("should correctly summarize a flow with expected downtime", func() {
+		// This uses the internal/records logic directly, effectively a unit test
+		// but placed here as requested by feedback.
+
+		// Start time: T0
+		t0, _ := time.Parse(time.RFC3339, "2024-01-01T00:00:00Z")
+		ctx := context.Background()
+
+		// 1. Initialize empty record
+		var rec records.EventRecords
+
+		// 2. T0: Component starts (Not Up yet)
+		records.AppendUpEvent(t0, &rec, false, false)
+
+		// 3. T+10m: Component becomes Ready (Up)
+		t1 := t0.Add(10 * time.Minute)
+		records.AppendUpEvent(t1, &rec, true, false)
+
+		// 4. T+30m: Component goes into EXPECTED maintenance
+		// This should NOT count as an interruption.
+		t2 := t0.Add(30 * time.Minute)
+		records.AppendUpEvent(t2, &rec, false, true) // isUp=false, expected=true
+
+		// 5. T+60m: Component comes back Up (no recovery)
+		t3 := t0.Add(60 * time.Minute)
+		records.AppendUpEvent(t3, &rec, true, false)
+
+		// 6. T+90m: Component crashes (UNPLANNED down)
+		// This SHOULD count as an interruption.
+		t4 := t0.Add(90 * time.Minute)
+		records.AppendUpEvent(t4, &rec, false, false) // isUp=false, expected=false
+
+		// 7. T+100m: Component recovers
+		t5 := t0.Add(100 * time.Minute)
+		records.AppendUpEvent(t5, &rec, true, false)
+
+		// Verify at T+120m
+		now := t0.Add(120 * time.Minute)
+		summary := rec.Summarize(ctx, now)
+
+		// 1. Interruption Count should be exactly 1 (the crash at T+90m).
+		Expect(summary.InterruptionCount).To(Equal(1), "InterruptionCount mismatch")
+
+		// 2. Recovery Count should be 1.
+		Expect(summary.RecoveryCount).To(Equal(1), "RecoveryCount mismatch")
+
+		// 3. Check Downtime Durations
+		// Initial Down: t0 -> t1 = 10m
+		Expect(summary.DownTimeInitial).To(Equal(10*time.Minute), "DownTimeInitial mismatch")
+
+		// Total Down Time: 10m + 30m + 10m = 50m
+		Expect(summary.DownTime).To(Equal(50*time.Minute), "Total DownTime mismatch")
+
+		// Total Up Time: 20m + 30m + 20m = 70m
+		Expect(summary.UpTime).To(Equal(70*time.Minute), "Total UpTime mismatch")
+	})
+})

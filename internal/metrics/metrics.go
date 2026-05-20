@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"example.com/megamon/internal/records"
+	"example.com/megamon/pkg/version"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -19,6 +20,8 @@ import (
 
 var (
 	AggregationDuration metric.Float64Histogram
+	GCSLatency          metric.Float64Histogram
+	GKELatency          metric.Float64Histogram
 	Prefix              = "megamon"
 	log                 = logf.Log.WithName("metrics")
 )
@@ -68,13 +71,27 @@ type Reporter interface {
 	Report() records.Report
 }
 
-func Init(ctx context.Context, r Reporter, interval time.Duration, unknownThreshold float64) func() {
+func Init(ctx context.Context, r Reporter, interval time.Duration, unknownThreshold float64, sliceEnabled bool) func() {
 	// Initialize the OpenTelemetry Prometheus exporter and meter provider.
 	provider := initMeterProvider(ctx, interval)
 
 	meter := otel.Meter("megamon")
 
 	var err error
+	GCSLatency, err = meter.Float64Histogram(Prefix+".gcs.latency",
+		metric.WithDescription("Duration of GCS calls."),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 2, 5),
+	)
+	fatal(err)
+
+	GKELatency, err = meter.Float64Histogram(Prefix+".gke.latency",
+		metric.WithDescription("Duration of GKE API calls."),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 2, 5),
+	)
+	fatal(err)
+
 	AggregationDuration, err = meter.Float64Histogram(Prefix+".aggregation.duration",
 		metric.WithDescription("Duration of the aggregation loop."),
 		metric.WithUnit("s"),
@@ -87,15 +104,44 @@ func Init(ctx context.Context, r Reporter, interval time.Duration, unknownThresh
 	)
 	fatal(err)
 
-	jobsetObservables, observeJobset := mustRegisterUpnessMetrics(Prefix+".jobset", meter, unknownThreshold)
-	jobsetNodeObservables, observeJobsetNodes := mustRegisterUpnessMetrics(Prefix+".jobset.nodes", meter, unknownThreshold)
-	nodePoolObservables, observeNodePools := mustRegisterUpnessMetrics(Prefix+".nodepool", meter, unknownThreshold)
+	// New build info metric (Task 3)
+	buildInfo, err := meter.Int64ObservableGauge(Prefix+".build.info",
+		metric.WithDescription("Build information with version and commit."),
+	)
+	fatal(err)
 
-	observables := append(jobsetObservables, jobsetNodeObservables...)
+	jobsetObservables, observeJobset := mustRegisterUpnessMetrics(Prefix+".jobset", meter, unknownThreshold)
+	var jobsetNodeObservables []metric.Observable
+	var observeJobsetNodes reportObserveFunc
+	if !sliceEnabled {
+		jobsetNodeObservables, observeJobsetNodes = mustRegisterUpnessMetrics(Prefix+".jobset.nodes", meter, unknownThreshold)
+	}
+	nodePoolObservables, observeNodePools := mustRegisterUpnessMetrics(Prefix+".nodepool", meter, unknownThreshold)
+	var sliceObservables []metric.Observable
+	var observeSlices reportObserveFunc
+	if sliceEnabled {
+		sliceObservables, observeSlices = mustRegisterUpnessMetrics(Prefix+".slice", meter, unknownThreshold)
+	}
+
+	observables := jobsetObservables
+	if !sliceEnabled {
+		observables = append(observables, jobsetNodeObservables...)
+	}
 	observables = append(observables, nodePoolObservables...)
+	if sliceEnabled {
+		observables = append(observables, sliceObservables...)
+	}
 	observables = append(observables, nodePoolJobScheduled)
+	observables = append(observables, buildInfo)
 
 	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		// Emit build info (always 1, attributes carry the data)
+		o.ObserveInt64(buildInfo, 1, metric.WithAttributes(
+			attribute.String("version", version.Version),
+			attribute.String("commit", version.Commit),
+			attribute.String("date", version.Date),
+		))
+
 		if !r.ReportReady() {
 			return nil
 		}
@@ -103,8 +149,13 @@ func Init(ctx context.Context, r Reporter, interval time.Duration, unknownThresh
 		report := r.Report()
 
 		observeJobset(ctx, o, report.JobSetsUp, report.JobSetsUpSummaries)
-		observeJobsetNodes(ctx, o, report.JobSetNodesUp, report.JobSetNodesUpSummaries)
+		if !sliceEnabled {
+			observeJobsetNodes(ctx, o, report.JobSetNodesUp, report.JobSetNodesUpSummaries)
+		}
 		observeNodePools(ctx, o, report.NodePoolsUp, report.NodePoolsUpSummaries)
+		if sliceEnabled {
+			observeSlices(ctx, o, report.SlicesUp, report.SlicesUpSummaries)
+		}
 
 		for npName, sch := range report.NodePoolScheduling {
 			o.ObserveInt64(nodePoolJobScheduled, 1, metric.WithAttributes(
@@ -153,6 +204,18 @@ func OTELAttrs(attrs records.Attrs) []attribute.KeyValue {
 	}
 	if attrs.NodePoolName != "" {
 		otelAttrs = append(otelAttrs, attribute.String("nodepool.name", attrs.NodePoolName))
+	}
+	if attrs.SliceName != "" {
+		otelAttrs = append(otelAttrs, attribute.String("slice.name", attrs.SliceName))
+	}
+	if attrs.SliceOwnerName != "" {
+		otelAttrs = append(otelAttrs, attribute.String("slice.owner.name", attrs.SliceOwnerName))
+	}
+	if attrs.SliceOwnerNamespace != "" {
+		otelAttrs = append(otelAttrs, attribute.String("slice.owner.namespace", attrs.SliceOwnerNamespace))
+	}
+	if attrs.SliceOwnerKind != "" {
+		otelAttrs = append(otelAttrs, attribute.String("slice.owner.kind", attrs.SliceOwnerKind))
 	}
 	return otelAttrs
 }
@@ -242,7 +305,7 @@ func mustRegisterUpnessMetrics(prefix string, meter metric.Meter, unknownThresho
 	observeFunc := func(ctx context.Context, o metric.Observer, upnesses map[string]records.Upness, summaries map[string]records.UpnessSummaryWithAttrs) {
 		for _, upness := range upnesses {
 			val := int64(0)
-			if upness.Up(unknownThreshold) {
+			if upness.Up(unknownThreshold) && !upness.ExpectedDown {
 				val = 1
 			}
 			o.ObserveInt64(up, val, metric.WithAttributes(

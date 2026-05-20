@@ -1,3 +1,7 @@
+// Package records defines the data structures and logic for tracking resource "upness" over time.
+// This file specifically handles the management of historical EventRecords, which store a sequence
+// of state change events (Up/Down) for a given resource. It provides the core logic for
+// reconciling current observations against historical data to detect interruptions and recoveries.
 package records
 
 import (
@@ -14,8 +18,9 @@ type EventRecords struct {
 }
 
 type UpEvent struct {
-	Up        bool      `json:"up"`
-	Timestamp time.Time `json:"ts"`
+	Up           bool      `json:"up"`
+	ExpectedDown bool      `json:"ed,omitempty"`
+	Timestamp    time.Time `json:"ts"`
 }
 
 type UpnessSummaryWithAttrs struct {
@@ -54,16 +59,16 @@ type EventSummary struct {
 
 func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummary {
 	var summary EventSummary
-	summaryLog := logf.FromContext(ctx).WithName("events")
+	log := logf.FromContext(ctx).WithName("events")
 
 	n := len(r.UpEvents)
-	summaryLog.V(3).Info("summarizing events", "event_count", n)
+	log.V(3).Info("summarizing events", "event_count", n)
 	if n == 0 {
 		return summary
 	}
 	if r.UpEvents[0].Up {
 		// Invalid data.
-		summaryLog.V(3).Info("invalid data: first event is up")
+		log.V(3).Info("invalid data: first event is up")
 		return summary
 	}
 	if n == 1 {
@@ -72,7 +77,7 @@ func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummar
 	}
 	// Invalid or missing data:
 	if !r.UpEvents[1].Up {
-		summaryLog.V(3).Info("invalid data: second event is not up")
+		log.V(3).Info("invalid data: second event is not up")
 		return summary
 	}
 
@@ -91,27 +96,43 @@ func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummar
 	// up:        _____
 	// down:  ____|   |
 	// event: 0   1   2
+	// (Down events with ExpectedDown=true don't increment InterruptionCount)
 	for i := 2; i < len(r.UpEvents); i++ {
 		if r.UpEvents[i].Up {
 			// Just transitioned down to up.
 			summary.LatestDownTimeBetweenRecovery = r.UpEvents[i].Timestamp.Sub(r.UpEvents[i-1].Timestamp)
 			summary.DownTime += summary.LatestDownTimeBetweenRecovery
 			summary.TotalDownTimeBetweenRecovery += summary.LatestDownTimeBetweenRecovery
-			summary.RecoveryCount++
-			summaryLog.V(5).Info("recovery event found, incrementing count")
+			// Only increment recovery count if it's NOT recovering from expected downtime.
+			if !r.UpEvents[i-1].ExpectedDown {
+				summary.RecoveryCount++
+				log.V(5).Info("recovery event found, incrementing count")
+			} else {
+				log.Info("WARNING: unexpected recovery from expected downtime event found", "upEvents", r.UpEvents)
+			}
 		} else {
 			// Just transitioned up to down.
 			summary.LatestUpTimeBetweenInterruption = r.UpEvents[i].Timestamp.Sub(r.UpEvents[i-1].Timestamp)
 			summary.UpTime += summary.LatestUpTimeBetweenInterruption
 			summary.TotalUpTimeBetweenInterruption += summary.LatestUpTimeBetweenInterruption
-			summary.InterruptionCount++
-			summaryLog.V(5).Info("interruption event found, incrementing count")
+
+			// Only increment interruption count if it's NOT expected downtime.
+			if !r.UpEvents[i].ExpectedDown {
+				summary.InterruptionCount++
+				log.V(5).Info("interruption event found, incrementing count")
+			} else {
+				log.V(5).Info("expected downtime event found, skipping interruption count")
+			}
 		}
 	}
 
 	// Calculate means.
 	if summary.InterruptionCount > 0 {
 		summary.MeanUpTimeBetweenInterruption = summary.TotalUpTimeBetweenInterruption / time.Duration(summary.InterruptionCount)
+	} else {
+		// If there are no interruptions, semantically "Time Between Interruption" is undefined/zero.
+		// We zero it out to avoid redundancy with UpTime and confusion.
+		summary.TotalUpTimeBetweenInterruption = 0
 	}
 	if summary.RecoveryCount > 0 {
 		summary.MeanDownTimeBetweenRecovery = summary.TotalDownTimeBetweenRecovery / time.Duration(summary.RecoveryCount)
@@ -125,46 +146,61 @@ func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummar
 		summary.DownTime = summary.DownTime + now.Sub(r.UpEvents[lastIdx].Timestamp)
 	}
 
-	summaryLog.V(1).Info("event summary", "summary", summary)
+	log.V(1).Info("event summary", "summary", summary)
 	return summary
 }
 
-func AppendUpEvent(now time.Time, rec *EventRecords, isUp bool) bool {
+func AppendUpEvent(now time.Time, rec *EventRecords, isUp bool, expectedDown bool) bool {
 	var changed bool
 	if len(rec.UpEvents) == 0 {
 		rec.UpEvents = append(rec.UpEvents, UpEvent{
-			Up:        false,
-			Timestamp: now,
+			Up:           false,
+			ExpectedDown: expectedDown,
+			Timestamp:    now,
 		})
 		changed = true
 	}
+
 	last := rec.UpEvents[len(rec.UpEvents)-1]
 	if last.Up != isUp {
 		rec.UpEvents = append(rec.UpEvents, UpEvent{
-			Up:        isUp,
-			Timestamp: now,
+			Up:           isUp,
+			ExpectedDown: expectedDown,
+			Timestamp:    now,
 		})
 		changed = true
 	}
 	return changed
 }
 
-func ReconcileEvents(ctx context.Context, now time.Time, ups map[string]Upness, events map[string]EventRecords, unknownThreshold float64) bool {
+func AppendStateChangeEvents(ctx context.Context, now time.Time, ups map[string]Upness, events map[string]EventRecords, unknownThreshold float64) bool {
 	var changed bool
 
-	reconcileLog := logf.FromContext(ctx).WithName("events")
+	log := logf.FromContext(ctx).WithName("events")
 
 	for key, up := range ups {
 		rec := events[key]
-		reconcileLog.Info("ReconcileEvents", "key", key, "expected", up.ExpectedCount, "ready", up.ReadyCount, "unknownCount", up.UnknownCount, "unknownThreshold", unknownThreshold)
-		if AppendUpEvent(now, &rec, up.Up(unknownThreshold)) {
-			events[key] = rec
+		log.Info("AppendStateChangeEvents", "key", key, "expected", up.ExpectedCount, "ready", up.ReadyCount, "unknownCount", up.UnknownCount, "unknownThreshold", unknownThreshold, "status", up.Status)
+
+		isUp := up.Up(unknownThreshold)
+
+		// If ExpectedDown is true (e.g. JobSet Completed), force isUp to false.
+		// This ensures we stop the UpTime clock and record a Down event (Expected),
+		// regardless of whether the Pod counts (Ready vs Expected) technically imply Up.
+		if up.ExpectedDown {
+			isUp = false
+		}
+
+		if AppendUpEvent(now, &rec, isUp, up.ExpectedDown) {
 			changed = true
 		}
+		events[key] = rec
 	}
 
+	// Handle items that are no longer present in the current state.
 	for key := range events {
 		if _, ok := ups[key]; !ok {
+			log.Info("deleting metric", "key", key)
 			delete(events, key)
 			changed = true
 		}

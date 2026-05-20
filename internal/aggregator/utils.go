@@ -30,6 +30,7 @@ func extractJobSetAttrs(js *jobset.JobSet) records.Attrs {
 			case k8sutils.NodeLabelGKETPUTopology:
 				attrs.TPUTopology = val
 				if topologyChipCount, err := k8sutils.GetTpuTopologyToChipCount(val); err == nil {
+					// #nosec G115
 					chipCount += rj.Replicas * int32(topologyChipCount)
 				} else {
 					log.Error(err, "error converting TPU topology to chip count", "topology", val)
@@ -57,6 +58,9 @@ func extractNodeAttrs(node *corev1.Node) records.Attrs {
 		}
 		if val, ok := node.Labels[k8sutils.NodeLabelGKETPUTopology]; ok {
 			attrs.TPUTopology = val
+		}
+		if val, ok := node.Labels[k8sutils.NodeLabelGKETPUSlice]; ok {
+			attrs.SliceName = val
 		}
 		if val, ok := node.Labels[k8sutils.NodeLabelGKESpot]; ok {
 			attrs.Spot = val == "true"
@@ -98,6 +102,7 @@ func getExpectedTPUNodePoolSize(np *containerv1beta1.NodePool) (int32, error) {
 		product *= x
 	}
 
+	// #nosec G115
 	return int32(product / acceleratorCount), nil
 }
 

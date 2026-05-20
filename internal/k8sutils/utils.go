@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
 
 func GetNodePool(node *corev1.Node) (string, bool) {
@@ -27,16 +28,24 @@ func IsTPUNode(node *corev1.Node) bool {
 	return ok
 }
 
-func IsJobSetActive(js *jobset.JobSet) bool {
+// GetJobSetTerminalState checks the JobSet's status conditions for a terminal state.
+// It returns the terminal state condition type (Completed, Failed, Suspended)
+// and a boolean indicating if a terminal state was found.
+func GetJobSetTerminalState(js *jobset.JobSet) (jobset.JobSetConditionType, bool) {
 	for _, c := range js.Status.Conditions {
 		if c.Status == metav1.ConditionTrue {
 			switch jobset.JobSetConditionType(c.Type) {
-			case jobset.JobSetFailed, jobset.JobSetCompleted, jobset.JobSetSuspended:
-				return false
+			case jobset.JobSetCompleted, jobset.JobSetFailed, jobset.JobSetSuspended:
+				return jobset.JobSetConditionType(c.Type), true
 			}
 		}
 	}
-	return true
+	return "", false
+}
+
+// TODO need to implement
+func GetLeaderWorkerSetTerminalState(lwsObj *lws.LeaderWorkerSet) (lws.LeaderWorkerSetConditionType, bool) {
+	return "", false
 }
 
 func GetJobSetReplicas(js *jobset.JobSet) (int32, int32) {
@@ -132,6 +141,7 @@ func GetExpectedTPUNodePoolSize(node *corev1.Node) (int32, error) {
 	if err != nil {
 		return 0, err
 	}
+	// #nosec G115
 	return int32(product / acceleratorCount), nil
 }
 

@@ -17,9 +17,16 @@ type EventRecords struct {
 	UpEvents []UpEvent `json:"upEvents"`
 }
 
+const (
+	ProvisioningStateProvisioning = "provisioning"
+	ProvisioningStateSuccess      = "success"
+	ProvisioningStateFailed       = "failed"
+)
+
 type UpEvent struct {
 	Up           bool      `json:"up"`
 	ExpectedDown bool      `json:"ed,omitempty"`
+	Failed       bool      `json:"f,omitempty"`
 	Timestamp    time.Time `json:"ts"`
 }
 
@@ -55,6 +62,11 @@ type EventSummary struct {
 	MeanDownTimeBetweenRecovery time.Duration `json:"meanDownTimeBetweenRecovery"`
 	// MeanUpTimeBetweenInterruption - Mean Time Between Interruption
 	MeanUpTimeBetweenInterruption time.Duration `json:"meanUpTimeBetweenInterruption"`
+
+	// ProvisioningDuration is the time spent provisioning.
+	ProvisioningDuration time.Duration `json:"provisioningDuration"`
+	// ProvisioningState is the state of provisioning.
+	ProvisioningState string `json:"provisioningState"`
 }
 
 func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummary {
@@ -73,16 +85,27 @@ func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummar
 	}
 	if n == 1 {
 		summary.DownTime = now.Sub(r.UpEvents[0].Timestamp)
+		summary.ProvisioningDuration = summary.DownTime
+		summary.ProvisioningState = ProvisioningStateProvisioning
 		return summary
 	}
 	// Invalid or missing data:
 	if !r.UpEvents[1].Up {
-		log.V(3).Info("invalid data: second event is not up")
+		if r.UpEvents[1].Failed {
+			summary.DownTime = r.UpEvents[1].Timestamp.Sub(r.UpEvents[0].Timestamp)
+			summary.DownTimeInitial = summary.DownTime
+			summary.ProvisioningDuration = summary.DownTimeInitial
+			summary.ProvisioningState = ProvisioningStateFailed
+			return summary
+		}
+		log.V(3).Info("invalid data: second event is not up and not failed")
 		return summary
 	}
 
 	summary.DownTime = r.UpEvents[1].Timestamp.Sub(r.UpEvents[0].Timestamp)
 	summary.DownTimeInitial = r.UpEvents[1].Timestamp.Sub(r.UpEvents[0].Timestamp)
+	summary.ProvisioningDuration = summary.DownTimeInitial
+	summary.ProvisioningState = ProvisioningStateSuccess
 
 	// up:        ___
 	// down:  ____|
@@ -150,22 +173,24 @@ func (r *EventRecords) Summarize(ctx context.Context, now time.Time) EventSummar
 	return summary
 }
 
-func AppendUpEvent(now time.Time, rec *EventRecords, isUp bool, expectedDown bool) bool {
+func AppendUpEvent(now time.Time, rec *EventRecords, isUp bool, expectedDown bool, failed bool) bool {
 	var changed bool
 	if len(rec.UpEvents) == 0 {
 		rec.UpEvents = append(rec.UpEvents, UpEvent{
 			Up:           false,
 			ExpectedDown: expectedDown,
+			Failed:       failed,
 			Timestamp:    now,
 		})
 		changed = true
 	}
 
 	last := rec.UpEvents[len(rec.UpEvents)-1]
-	if last.Up != isUp {
+	if last.Up != isUp || last.Failed != failed || last.ExpectedDown != expectedDown {
 		rec.UpEvents = append(rec.UpEvents, UpEvent{
 			Up:           isUp,
 			ExpectedDown: expectedDown,
+			Failed:       failed,
 			Timestamp:    now,
 		})
 		changed = true
@@ -180,7 +205,7 @@ func AppendStateChangeEvents(ctx context.Context, now time.Time, ups map[string]
 
 	for key, up := range ups {
 		rec := events[key]
-		log.Info("AppendStateChangeEvents", "key", key, "expected", up.ExpectedCount, "ready", up.ReadyCount, "unknownCount", up.UnknownCount, "unknownThreshold", unknownThreshold, "status", up.Status)
+		log.Info("AppendStateChangeEvents", "key", key, "expected", up.ExpectedCount, "ready", up.ReadyCount, "unknownCount", up.UnknownCount, "unknownThreshold", unknownThreshold, "status", up.Status, "failed", up.Failed)
 
 		isUp := up.Up(unknownThreshold)
 
@@ -191,7 +216,7 @@ func AppendStateChangeEvents(ctx context.Context, now time.Time, ups map[string]
 			isUp = false
 		}
 
-		if AppendUpEvent(now, &rec, isUp, up.ExpectedDown) {
+		if AppendUpEvent(now, &rec, isUp, up.ExpectedDown, up.Failed) {
 			changed = true
 		}
 		events[key] = rec

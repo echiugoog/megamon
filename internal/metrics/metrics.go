@@ -153,6 +153,7 @@ func Init(ctx context.Context, r Reporter, interval time.Duration, unknownThresh
 			observeJobsetNodes(ctx, o, report.JobSetNodesUp, report.JobSetNodesUpSummaries)
 		}
 		observeNodePools(ctx, o, report.NodePoolsUp, report.NodePoolsUpSummaries)
+
 		if sliceEnabled {
 			observeSlices(ctx, o, report.SlicesUp, report.SlicesUpSummaries)
 		}
@@ -262,6 +263,12 @@ func mustRegisterUpnessMetrics(prefix string, meter metric.Meter, unknownThresho
 	)
 	fatal(err)
 
+	provisioningDuration, err := meter.Float64ObservableGauge(prefix+".provisioning.duration",
+		metric.WithDescription("Time spent provisioning."),
+		metric.WithUnit("s"),
+	)
+	fatal(err)
+
 	downTimeBetweenRecovery, err := meter.Float64ObservableGauge(prefix+".down.time.between.recovery",
 		metric.WithDescription("Total time spent down between being all interruptions and recoveries."),
 		metric.WithUnit("s"),
@@ -343,6 +350,10 @@ func mustRegisterUpnessMetrics(prefix string, meter metric.Meter, unknownThresho
 			if summary.TPUChipCount != 0 {
 				o.ObserveInt64(tpuChipCount, int64(summary.TPUChipCount), metric.WithAttributes(commonAttrs...))
 			}
+			if summary.ProvisioningState != "" {
+				attrs := append(commonAttrs, attribute.String("provisioning_state", summary.ProvisioningState))
+				o.ObserveFloat64(provisioningDuration, summary.ProvisioningDuration.Seconds(), metric.WithAttributes(attrs...))
+			}
 		}
 	}
 
@@ -360,6 +371,7 @@ func mustRegisterUpnessMetrics(prefix string, meter metric.Meter, unknownThresho
 		interruptionCount,
 		recoveryCount,
 		tpuChipCount,
+		provisioningDuration,
 	}, observeFunc
 }
 

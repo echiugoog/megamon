@@ -1,5 +1,10 @@
 # Release Notes
 
+## v1.1.1
+
+### New features and improvements
+* Add standardized `<resource>.provisioning.duration` metric family (e.g. `nodepool.provisioning.duration`, `jobset.provisioning.duration`) to track resource provisioning latency with state tracking (`provisioning`, `success`, `failed`). See [docs/metrics.md](metrics.md) for details.
+
 ## v1.1.0
 
 ### New features and improvements
